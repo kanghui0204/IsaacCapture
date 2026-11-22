@@ -16,6 +16,20 @@ def perspective_crop(
     camera: CameraModel,
     crop_side_pixels: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """``perspective_crop_uint8`` with the crop as float32 RGB divided by 255."""
+    crop_rgb, K_virtual, bbox_virtual, crop_to_source_rotation = perspective_crop_uint8(
+        image_bgr, bbox, camera, crop_side_pixels
+    )
+    crop_rgb = crop_rgb.astype(np.float32) / 255.0
+    return crop_rgb, K_virtual, bbox_virtual, crop_to_source_rotation
+
+
+def perspective_crop_uint8(
+    image_bgr: np.ndarray,
+    bbox: np.ndarray,
+    camera: CameraModel,
+    crop_side_pixels: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Create a square perspective crop of a detected hand region.
 
     The camera turns toward the box-center ray using the shortest rotation from
@@ -32,7 +46,7 @@ def perspective_crop(
             pixels. The caller sets it from the resolution its model consumes.
 
     Returns:
-        Tuple of the square RGB crop (float32, pixel values divided by 255),
+        Tuple of the square RGB crop (uint8; ``perspective_crop`` divides it by 255),
         virtual pinhole intrinsics, full-crop bbox ``[center_x, center_y,
         side_length]`` in crop pixels, and the rotation from crop-camera to
         source-camera coordinates, in that order.
@@ -106,7 +120,6 @@ def perspective_crop(
         borderValue=0,
     )
     crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-    crop_rgb = crop_rgb.astype(np.float32) / 255.0
     K_virtual = np.array(
         [
             [focal_length, 0, crop_center],

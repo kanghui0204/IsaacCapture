@@ -634,6 +634,30 @@ class EgoHandPredictor:
                 crop_jobs, _build_input, image_ids, prepared_inputs_by_image
             )
 
+        results_per_hand = self._results_per_hand(
+            predictions, hands, prepared_inputs_by_image
+        )
+
+        if not defer_smoothing:
+            self.postprocess_results(
+                results_per_hand,
+                image_ids,
+                bboxes_per_image,
+                frame_times=frame_times,
+                intrinsics_per_image=intrinsics_per_image,
+                source_cameras_per_image=source_cameras_per_image,
+            )
+        if output_paths_per_hand is not None:
+            self.save_results(results_per_hand, output_paths_per_hand)
+        return results_per_hand
+
+    def _results_per_hand(self, predictions, hands, prepared_inputs_by_image):
+        """``{hand: {image_id: result}}`` from the flat predictions, in their order.
+
+        With perspective cropping, geometry, translation and wrist rotation go
+        back from the crop camera to source-camera axes
+        (``prepared_inputs_by_image[image_id][hand]`` holds the rotation).
+        """
         results_per_hand = {hand: {} for hand in hands}
         for result in predictions:
             image_id = result["image_id"]
@@ -667,18 +691,6 @@ class EgoHandPredictor:
                 # A pinhole K cannot project source pixels with lens distortion.
                 result["K_fullimg"] = None
             results_per_hand[hand][image_id] = result
-
-        if not defer_smoothing:
-            self.postprocess_results(
-                results_per_hand,
-                image_ids,
-                bboxes_per_image,
-                frame_times=frame_times,
-                intrinsics_per_image=intrinsics_per_image,
-                source_cameras_per_image=source_cameras_per_image,
-            )
-        if output_paths_per_hand is not None:
-            self.save_results(results_per_hand, output_paths_per_hand)
         return results_per_hand
 
     def _prepare_all_then_predict(

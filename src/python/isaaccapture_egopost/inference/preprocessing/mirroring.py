@@ -7,7 +7,8 @@ import numpy as np
 import torch
 
 from inference.preprocessing.crop import (
-    crop_and_preprocess,
+    crop_uint8,
+    normalize_crop,
     project_camera_points_to_crop_with_validity,
 )
 
@@ -110,7 +111,23 @@ def prepare_right_hand_model_input(
         ``(normalized_crop, model_bbox, model_K)`` in the canonical-left
         model input frame.
     """
+    crop_u8, model_bbox, model_K = prepare_right_hand_model_input_uint8(
+        img_bgr, bbx_xys, K_fullimg, calibrated_full_image=calibrated_full_image
+    )
+    # Normalization is elementwise, so normalizing the mirrored uint8 crop
+    # gives the values of mirroring the normalized crop.
+    return normalize_crop(crop_u8), model_bbox, model_K
 
+
+def prepare_right_hand_model_input_uint8(
+    img_bgr: np.ndarray,
+    bbx_xys: np.ndarray,
+    K_fullimg: np.ndarray,
+    *,
+    calibrated_full_image: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``prepare_right_hand_model_input`` with the uint8 ``HWC`` RGB crop
+    (``prepare_right_hand_model_input`` normalizes this crop)."""
     image = np.asarray(img_bgr)
     if image.ndim != 3:
         raise ValueError(f"img_bgr must have shape (H, W, C), got {image.shape}")
@@ -122,19 +139,13 @@ def prepare_right_hand_model_input(
             image_width,
         )
         flipped_full_image = np.ascontiguousarray(image[:, ::-1])
-        crop_tensor, _ = crop_and_preprocess(
-            flipped_full_image,
-            model_bbox,
-        )
-    else:
-        model_bbox, model_K = mirror_legacy_crop_camera_horizontal(
-            bbx_xys,
-            K_fullimg,
-            image_width,
-        )
-        crop_tensor, _ = crop_and_preprocess(image, bbx_xys)
-        crop_tensor = crop_tensor.flip(-1)
-    return crop_tensor, model_bbox, model_K
+        return crop_uint8(flipped_full_image, model_bbox), model_bbox, model_K
+    model_bbox, model_K = mirror_legacy_crop_camera_horizontal(
+        bbx_xys,
+        K_fullimg,
+        image_width,
+    )
+    return crop_uint8(image, bbx_xys)[:, ::-1], model_bbox, model_K
 
 
 def mirror_left_prediction_to_right(

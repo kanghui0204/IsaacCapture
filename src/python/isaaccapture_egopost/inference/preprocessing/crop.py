@@ -15,6 +15,28 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 IMG_SIZE = 256
 
 
+def crop_uint8(img_bgr, bbx_xys):
+    """The ``IMG_SIZE`` x ``IMG_SIZE`` uint8 RGB crop of ``crop_and_preprocess``."""
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    cx, cy, size = float(bbx_xys[0]), float(bbx_xys[1]), float(bbx_xys[2])
+    trans = get_transform(
+        center=np.array([cx, cy]), scale=size, res=(IMG_SIZE, IMG_SIZE), rot=0
+    )
+    return cv2.warpAffine(img_rgb, trans, (IMG_SIZE, IMG_SIZE), flags=cv2.INTER_LINEAR)
+
+
+def normalize_crop(img_crop):
+    """Normalize a uint8 ``HWC`` RGB crop to the model's float32 ``CHW`` input.
+
+    The expression of ``crop_and_preprocess``; perspective crops (``/ 255``
+    in ``perspective_crop``, then the same mean / std) give the same values.
+    Elementwise, so normalizing a mirrored crop equals mirroring the input.
+    """
+    img_f = img_crop.astype(np.float32) / 255.0
+    img_f = (img_f - IMAGENET_MEAN) / IMAGENET_STD
+    return torch.from_numpy(img_f.transpose(2, 0, 1))
+
+
 def crop_and_preprocess(img_bgr, bbx_xys):
     """Crop a hand bbox and normalize it for EgoHand inference.
 
@@ -25,18 +47,8 @@ def crop_and_preprocess(img_bgr, bbx_xys):
     Returns:
         Normalized ``CHW`` tensor and the unnormalized RGB crop.
     """
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    cx, cy, size = float(bbx_xys[0]), float(bbx_xys[1]), float(bbx_xys[2])
-    trans = get_transform(
-        center=np.array([cx, cy]), scale=size, res=(IMG_SIZE, IMG_SIZE), rot=0
-    )
-    img_crop = cv2.warpAffine(
-        img_rgb, trans, (IMG_SIZE, IMG_SIZE), flags=cv2.INTER_LINEAR
-    )
-    img_f = img_crop.astype(np.float32) / 255.0
-    img_f = (img_f - IMAGENET_MEAN) / IMAGENET_STD
-    img_tensor = torch.from_numpy(img_f.transpose(2, 0, 1))
-    return img_tensor, img_crop
+    img_crop = crop_uint8(img_bgr, bbx_xys)
+    return normalize_crop(img_crop), img_crop
 
 
 def project_camera_points_to_crop_with_validity(
