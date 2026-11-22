@@ -709,6 +709,7 @@ def main():
         smooth=args.postprocessing_smooth,
         use_perspective_cropping=use_perspective_cropping,
         soma_batch_size=args.soma_batch_size,
+        mhr_presorted_sparse=args.mhr_presorted_sparse,
     )
     if args.background_model_load:
         print(

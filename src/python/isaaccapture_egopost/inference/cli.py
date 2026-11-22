@@ -123,6 +123,16 @@ def parse_args(argv=None, *, epilog: str | None = None):
         "order). Must be 0 or at least --batch_size; 512 is a good value.",
     )
     p.add_argument(
+        "--mhr_presorted_sparse",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Build the sparse matrix of the MHR hand model's pose correctives "
+        "once at load, already coalesced, instead of letting every SOMA call "
+        "sort it again. The per-call sort can crash with PyTorch builds for "
+        "CUDA 13.0 on sm_90+ GPUs (NVIDIA/cccl#5297). Results are unchanged. "
+        "Default: on. Pass --no-mhr_presorted_sparse to keep the per-call sort.",
+    )
+    p.add_argument(
         "--postprocessing_smooth",
         action=argparse.BooleanOptionalAction,
         default=True,
