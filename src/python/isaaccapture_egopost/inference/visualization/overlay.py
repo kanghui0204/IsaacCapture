@@ -7,6 +7,7 @@ render_clip is what inference/scripts/run_egohand_inference_pipeline.py calls to
 render the bbox/crop/fullimg overlay videos after EgoHand hand inference.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -258,141 +259,158 @@ def render_clip(
         return cv2.resize(img, (out_W, out_H), interpolation=cv2.INTER_AREA)
 
     # --- Bbox visualization (both hands on same image) ---
-    colors = {"left": (0, 255, 0), "right": (255, 0, 0)}  # green / blue (BGR)
-    bbox_viz_dir = out_dir / "bbox_viz"
-    bbox_writer = None
-    if save_images:
-        bbox_viz_dir.mkdir(parents=True, exist_ok=True)
-    if save_videos and len(frames) > 1:
-        bbox_writer = _open_video_writer(out_dir / "bbox_viz.mp4", out_W, out_H, fps)
-    for fi, frame in enumerate(frames):
-        vis = frame.copy()
-        for h in hands:
-            if bbx_per_hand[h][fi] is not None:
-                draw_bbox_on_image(vis, bbx_per_hand[h][fi], color=colors[h], label=h)
-        vis = _to_display(vis)
+    # It reads only ``frames`` and the boxes and writes only its own files, so it
+    # runs on a worker thread while this thread draws and encodes the crop and
+    # full-image overlays (renderers stay on this thread). Each file is still
+    # written frame by frame, in order, by one thread, so its bytes are unchanged.
+    def _write_bbox_viz():
+        colors = {"left": (0, 255, 0), "right": (255, 0, 0)}  # green / blue (BGR)
+        bbox_viz_dir = out_dir / "bbox_viz"
+        bbox_writer = None
         if save_images:
-            cv2.imwrite(str(bbox_viz_dir / f"{frame_names[fi]}_bbox.jpg"), vis)
+            bbox_viz_dir.mkdir(parents=True, exist_ok=True)
+        if save_videos and len(frames) > 1:
+            bbox_writer = _open_video_writer(
+                out_dir / "bbox_viz.mp4", out_W, out_H, fps
+            )
+        for fi, frame in enumerate(frames):
+            vis = frame.copy()
+            for h in hands:
+                if bbx_per_hand[h][fi] is not None:
+                    draw_bbox_on_image(
+                        vis, bbx_per_hand[h][fi], color=colors[h], label=h
+                    )
+            vis = _to_display(vis)
+            if save_images:
+                cv2.imwrite(str(bbox_viz_dir / f"{frame_names[fi]}_bbox.jpg"), vis)
+            if bbox_writer is not None:
+                bbox_writer.write(vis)
         if bbox_writer is not None:
-            bbox_writer.write(vis)
-    if bbox_writer is not None:
-        bbox_writer.release()
-    msg_parts = []
-    if save_images:
-        msg_parts.append(f"{bbox_viz_dir}/")
-    if bbox_writer is not None:
-        msg_parts.append(f"{out_dir / 'bbox_viz.mp4'}")
-    print(f"[render_clip] Bbox viz: {' + '.join(msg_parts)}")
-
-    # --- Crop overlays (per hand, separate videos) ---
-    save_crop_images = save_images and save_crop_overlays
-    save_crop_videos = save_videos and save_crop_overlays
-    if not save_crop_overlays:
-        print(
-            "[render_clip] Crop overlays: skipped (pass --save_crop_overlays to enable)"
-        )
-    for h in hands if save_crop_overlays else ():
-        results = results_per_hand[h]
-        crops, bbxs_viz, Ks_viz = crops_per_hand[h]
-        crop_out_dir = out_dir / f"crop_overlay_{h}"
-        if save_crop_images:
-            crop_out_dir.mkdir(parents=True, exist_ok=True)
-        crop_writer = None
-        if save_crop_videos and len(results) > 1:
-            crop_writer = _open_video_writer(
-                out_dir / f"crop_overlay_{h}.mp4",
-                IMG_SIZE,
-                IMG_SIZE,
-                fps,
-            )
-        renderer = Renderer(focal_length=1.0, faces=faces_by_hand[h])
-        for fi, (result, img_crop, bbx, K) in enumerate(
-            zip(results, crops, bbxs_viz, Ks_viz)
-        ):
-            if result is None or img_crop is None:
-                continue
-            if not (save_crop_images or crop_writer is not None):
-                continue
-            overlay = render_crop_overlay(
-                result,
-                img_crop,
-                bbx,
-                K,
-                faces_by_hand[h],
-                "egohand",
-                mesh_color=mesh_color,
-                renderer=renderer,
-            )
-            overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
-            if save_crop_images:
-                cv2.imwrite(
-                    str(crop_out_dir / f"{frame_names[fi]}_crop.jpg"), overlay_bgr
-                )
-            if crop_writer is not None:
-                crop_writer.write(overlay_bgr)
-        if crop_writer is not None:
-            crop_writer.release()
-        renderer.close()
+            bbox_writer.release()
         msg_parts = []
-        if save_crop_images:
-            msg_parts.append(f"{crop_out_dir}/")
-        if crop_writer is not None:
-            msg_parts.append(f"{out_dir / f'crop_overlay_{h}.mp4'}")
-        print(f"[render_clip] Crop overlays ({h}): {' + '.join(msg_parts)}")
+        if save_images:
+            msg_parts.append(f"{bbox_viz_dir}/")
+        if bbox_writer is not None:
+            msg_parts.append(f"{out_dir / 'bbox_viz.mp4'}")
+        return f"[render_clip] Bbox viz: {' + '.join(msg_parts)}"
 
-    # --- Full-image overlays (both hands chained onto same frame) ---
-    full_renderers = (
-        {}
-        if no_mesh
-        else {h: Renderer(focal_length=1.0, faces=faces_by_hand[h]) for h in hands}
-    )
-    full_out_dir = out_dir / "fullimg_overlay"
-    full_writer = None
-    if save_images:
-        full_out_dir.mkdir(parents=True, exist_ok=True)
-    if save_videos and len(frames) > 1:
-        full_writer = _open_video_writer(
-            out_dir / "fullimg_overlay.mp4", out_W, out_H, fps
-        )
-    skel_colors = {"left": (0, 255, 0), "right": (0, 0, 255)}
-    for fi, frame in enumerate(frames):
-        full_img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        for h in hands:
-            result = results_per_hand[h][fi]
-            if result is None:
-                continue
-            if not no_mesh:
-                full_img_rgb = draw_hand_mesh(
+    def _write_crop_and_fullimg_overlays():
+        # --- Crop overlays (per hand, separate videos) ---
+        save_crop_images = save_images and save_crop_overlays
+        save_crop_videos = save_videos and save_crop_overlays
+        if not save_crop_overlays:
+            print(
+                "[render_clip] Crop overlays: skipped (pass --save_crop_overlays to enable)"
+            )
+        for h in hands if save_crop_overlays else ():
+            results = results_per_hand[h]
+            crops, bbxs_viz, Ks_viz = crops_per_hand[h]
+            crop_out_dir = out_dir / f"crop_overlay_{h}"
+            if save_crop_images:
+                crop_out_dir.mkdir(parents=True, exist_ok=True)
+            crop_writer = None
+            if save_crop_videos and len(results) > 1:
+                crop_writer = _open_video_writer(
+                    out_dir / f"crop_overlay_{h}.mp4",
+                    IMG_SIZE,
+                    IMG_SIZE,
+                    fps,
+                )
+            renderer = Renderer(focal_length=1.0, faces=faces_by_hand[h])
+            for fi, (result, img_crop, bbx, K) in enumerate(
+                zip(results, crops, bbxs_viz, Ks_viz)
+            ):
+                if result is None or img_crop is None:
+                    continue
+                if not (save_crop_images or crop_writer is not None):
+                    continue
+                overlay = render_crop_overlay(
                     result,
-                    full_img_rgb,
-                    K_fullimg,
-                    None,
+                    img_crop,
+                    bbx,
+                    K,
                     faces_by_hand[h],
                     "egohand",
                     mesh_color=mesh_color,
-                    renderer=full_renderers[h],
+                    renderer=renderer,
                 )
-            if draw_skeleton:
-                draw_hand_skeleton(
-                    full_img_rgb,
-                    result["pred_keypoints_2d"],
-                    skel_colors[h],
-                    bbx_per_hand[h][fi],
-                )
-        overlay_bgr = _to_display(cv2.cvtColor(full_img_rgb, cv2.COLOR_RGB2BGR))
+                overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+                if save_crop_images:
+                    cv2.imwrite(
+                        str(crop_out_dir / f"{frame_names[fi]}_crop.jpg"), overlay_bgr
+                    )
+                if crop_writer is not None:
+                    crop_writer.write(overlay_bgr)
+            if crop_writer is not None:
+                crop_writer.release()
+            renderer.close()
+            msg_parts = []
+            if save_crop_images:
+                msg_parts.append(f"{crop_out_dir}/")
+            if crop_writer is not None:
+                msg_parts.append(f"{out_dir / f'crop_overlay_{h}.mp4'}")
+            print(f"[render_clip] Crop overlays ({h}): {' + '.join(msg_parts)}")
+
+        # --- Full-image overlays (both hands chained onto same frame) ---
+        full_renderers = (
+            {}
+            if no_mesh
+            else {h: Renderer(focal_length=1.0, faces=faces_by_hand[h]) for h in hands}
+        )
+        full_out_dir = out_dir / "fullimg_overlay"
+        full_writer = None
         if save_images:
-            cv2.imwrite(
-                str(full_out_dir / f"{frame_names[fi]}_fullimg.jpg"), overlay_bgr
+            full_out_dir.mkdir(parents=True, exist_ok=True)
+        if save_videos and len(frames) > 1:
+            full_writer = _open_video_writer(
+                out_dir / "fullimg_overlay.mp4", out_W, out_H, fps
             )
+        skel_colors = {"left": (0, 255, 0), "right": (0, 0, 255)}
+        for fi, frame in enumerate(frames):
+            full_img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            for h in hands:
+                result = results_per_hand[h][fi]
+                if result is None:
+                    continue
+                if not no_mesh:
+                    full_img_rgb = draw_hand_mesh(
+                        result,
+                        full_img_rgb,
+                        K_fullimg,
+                        None,
+                        faces_by_hand[h],
+                        "egohand",
+                        mesh_color=mesh_color,
+                        renderer=full_renderers[h],
+                    )
+                if draw_skeleton:
+                    draw_hand_skeleton(
+                        full_img_rgb,
+                        result["pred_keypoints_2d"],
+                        skel_colors[h],
+                        bbx_per_hand[h][fi],
+                    )
+            overlay_bgr = _to_display(cv2.cvtColor(full_img_rgb, cv2.COLOR_RGB2BGR))
+            if save_images:
+                cv2.imwrite(
+                    str(full_out_dir / f"{frame_names[fi]}_fullimg.jpg"), overlay_bgr
+                )
+            if full_writer is not None:
+                full_writer.write(overlay_bgr)
         if full_writer is not None:
-            full_writer.write(overlay_bgr)
-    if full_writer is not None:
-        full_writer.release()
-    for r in full_renderers.values():
-        r.close()
-    msg_parts = []
-    if save_images:
-        msg_parts.append(f"{full_out_dir}/")
-    if full_writer is not None:
-        msg_parts.append(f"{out_dir / 'fullimg_overlay.mp4'}")
-    print(f"[render_clip] Full-image overlays: {' + '.join(msg_parts)}")
+            full_writer.release()
+        for r in full_renderers.values():
+            r.close()
+        msg_parts = []
+        if save_images:
+            msg_parts.append(f"{full_out_dir}/")
+        if full_writer is not None:
+            msg_parts.append(f"{out_dir / 'fullimg_overlay.mp4'}")
+        return f"[render_clip] Full-image overlays: {' + '.join(msg_parts)}"
+
+    # Leaving the pool joins the worker, also when this thread's overlays fail.
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="bbox-viz") as pool:
+        bbox_viz_job = pool.submit(_write_bbox_viz)
+        fullimg_message = _write_crop_and_fullimg_overlays()
+    print(bbox_viz_job.result())  # re-raises a failure of the bbox writer
+    print(fullimg_message)

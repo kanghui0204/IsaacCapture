@@ -526,8 +526,12 @@ def process_video(
             ]
             for h in hands
         }
+        # render_clip reads these crops only for the per-hand crop overlays.
+        # Without them (the default, and always with perspective cropping or
+        # full-image undistortion) cropping every frame again would be wasted.
+        render_crop_overlays = save_crop_overlays and source_camera is None
         crops_per_hand = {}
-        for h in hands:
+        for h in hands if render_crop_overlays else ():
             crops, bbxs_viz, Ks_viz = [], [], []
             for frame, fid in zip(valid_frames, valid_fids):
                 bbx = bboxes_per_image.get(fid, {}).get(h)
@@ -563,7 +567,7 @@ def process_video(
             display_size=(W, H)
             if resize_params is not None and source_camera is None
             else None,
-            save_crop_overlays=save_crop_overlays and source_camera is None,
+            save_crop_overlays=render_crop_overlays,
         )
         if perf_reporter is not None and valid_fids:
             overlay_ms_per_frame = (
