@@ -1182,11 +1182,13 @@ _DTYPES = {
 
 
 def load_predictor(settings: dict):
-    """``EgoHandPredictor.from_checkpoint`` (+ DINO compile) from driver settings.
+    """``EgoHandPredictor.from_checkpoint`` (+ backbone options) from driver settings.
 
     ``settings["mhr_presorted_sparse"]`` (default True) is passed on:
     ``from_checkpoint`` coalesces the MHR sparse matrix once
     (``mhr_presort.py``); ``predictor.mhr_presort`` records what it patched.
+    The backbone options (``configure_backbone``) are applied here, so the load
+    time includes them; their setup facts are on ``predictor.backbone_setup``.
     """
     from inference.pipeline.predictor import EgoHandPredictor
 
@@ -1202,9 +1204,186 @@ def load_predictor(settings: dict):
         soma_batch_size=settings["soma_batch_size"],
         mhr_presorted_sparse=settings.get("mhr_presorted_sparse", True),
     )
-    if settings.get("dino_compile"):
-        predictor.enable_dino_compile()
+    predictor.backbone_setup = configure_backbone(predictor, settings)
     return predictor, (time.perf_counter() - t) * 1000.0
+
+
+# --------------------------------------------------------------------------- backbone options
+
+BACKBONE_COMPILE_SCOPES = ("off", "block", "whole")
+# Inductor options for every compiled backbone, so that reduction block sizes
+# never depend on first-call timing (block sizes sum in different orders, so
+# processes that time differently give different outputs).
+# dynamic_scale_rblock=False: no second R0_BLOCK for the residual + norm2 kernel.
+# deterministic=True: one fixed config for every reduction kernel with several
+# candidates (e.g. the LayerNorm after the patch embedding), which two processes
+# cold-compiling on one GPU picked differently; Inductor's deterministic mode
+# also changes some fusion / padding choices. Cost: none measurable (within
+# run-to-run throughput noise); outputs differ from builds without it, as far
+# from eager.
+# Pass deterministic here, not only process-wide (setup_compile_env): torch 2.13
+# Dynamo resets the global flag to torch.are_deterministic_algorithms_enabled()
+# after every traced frame (convert_frame -> use_deterministic_algorithms), so
+# the environment variable alone reaches only the first function Dynamo compiles
+# in the process. Today the backbone is that function (whole: one graph; block:
+# one graph shared by the 32 blocks); the option keeps every backbone compile
+# deterministic if something else compiles first or the backbone recompiles.
+# Only the three-stage driver passes these options; enable_dino_compile (the
+# single-video pipeline's --dino_compile) keeps mode="default".
+DETERMINISTIC_INDUCTOR_OPTIONS = {"dynamic_scale_rblock": False, "deterministic": True}
+
+
+def backbone_compile_scope(settings: dict) -> str:
+    """``backbone_compile`` if set, else ``"block"`` for the legacy ``dino_compile``."""
+    scope = settings.get("backbone_compile")
+    if scope in (None, ""):
+        scope = "block" if settings.get("dino_compile") else "off"
+    if scope not in BACKBONE_COMPILE_SCOPES:
+        raise ValueError(f"backbone_compile must be one of {BACKBONE_COMPILE_SCOPES}")
+    return scope
+
+
+def backbone_options_active(settings: dict) -> bool:
+    return backbone_compile_scope(settings) != "off" or bool(
+        settings.get("backbone_bf16_weights")
+    )
+
+
+def without_backbone_options(settings: dict) -> dict:
+    """Settings for a process that never runs the backbone (proc mode P3)."""
+    return {
+        **settings,
+        "dino_compile": False,
+        "backbone_compile": "off",
+        "backbone_bf16_weights": False,
+    }
+
+
+def configure_backbone(predictor, settings: dict) -> dict:
+    """Apply the backbone options of ``settings`` to a loaded predictor.
+
+    Order: weights first (``backbone_bf16_weights`` stores the Linear / Conv2d
+    weights in bf16), then the compile settings (lazy: the compile itself
+    happens on the first full batch, see ``warm_backbone``).
+    All options off: nothing is touched.
+    """
+    scope = backbone_compile_scope(settings)
+    bf16 = bool(settings.get("backbone_bf16_weights"))
+    info: dict = {"compile": scope, "bf16_weights": bf16}
+    if scope == "off" and not bf16:
+        return info
+    if bf16 and getattr(predictor, "dtype", None) != torch.bfloat16:
+        # The weights only give the same values when the backbone runs under
+        # bf16 autocast; float32 (no autocast) fails on the dtype mismatch and
+        # float16 autocast would round the bf16 weights again.
+        raise ValueError(
+            "backbone_bf16_weights needs the bfloat16 inference dtype, got "
+            f"{getattr(predictor, 'dtype', None)}"
+        )
+    backbone = getattr(predictor.model, "backbone", None)
+    t = time.perf_counter()
+    if bf16:
+        info["bf16_modules"] = backbone.cast_matmul_weights_bf16()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    info["weights_s"] = time.perf_counter() - t
+    if scope != "off":
+        predictor.enable_backbone_compile(
+            scope, options=dict(DETERMINISTIC_INDUCTOR_OPTIONS)
+        )
+        info["compile_options"] = dict(DETERMINISTIC_INDUCTOR_OPTIONS)
+        info["full_batch_size"] = predictor.batch_size
+    return info
+
+
+def dynamo_counters() -> dict:
+    """Graphs torch.compile has built so far in this process, recompiles, and
+    the Inductor / AOTAutograd cache hits and misses (cache_*)."""
+    try:
+        from torch._dynamo.utils import counters
+    except Exception:  # noqa: BLE001
+        return {}
+    out = {
+        "unique_graphs": int(counters["stats"].get("unique_graphs", 0)),
+        "recompiles": int(sum(counters["recompiles"].values()))
+        if "recompiles" in counters
+        else 0,
+    }
+    for group in ("inductor", "aot_autograd"):
+        if group in counters:
+            for key, value in counters[group].items():
+                if "cache" in key:
+                    out[f"cache_{key}"] = int(value)
+    return out
+
+
+@torch.no_grad()
+def warm_backbone(predictor, calls: int = 3) -> dict | None:
+    """Compile the backbone before the queue starts (once per process).
+
+    Runs ``calls`` full batches of random crops through the backbone the way
+    stage 2 calls it (``forward_step_head``: same batch size, the same
+    ``_backbone_crop_w`` view of a float32 ``[B, 3, 256, 256]`` batch, no_grad,
+    the same autocast), so the first real batch finds the compiled code and
+    every timing after "ready" excludes compilation. The crops come from a
+    private generator (the global RNG is untouched); outputs are discarded.
+    Returns the first-call time (compile + Inductor's first-call tuning) and the
+    later call times, or ``None`` when the backbone is not compiled.
+    """
+    from inference.preprocessing.crop import IMG_SIZE
+
+    model = getattr(predictor, "model", None)
+    backbone = getattr(model, "backbone", None)
+    batch = getattr(backbone, "_compiled_full_batch_size", None)
+    if backbone is None or batch is None:
+        return None
+    device = torch.device(predictor.device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    generator = torch.Generator(device=device)
+    generator.manual_seed(0)
+    img = torch.randn(
+        (batch, 3, IMG_SIZE, IMG_SIZE),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    )
+    crop = getattr(model, "_backbone_crop_w", None)
+    x = img[:, :, :, crop[0] : crop[1]] if crop is not None else img
+    dtype = predictor.dtype
+    before = dynamo_counters()
+    times = []
+    for _ in range(calls):
+        t = time.perf_counter()
+        with torch.autocast(device.type, dtype=dtype, enabled=(dtype != torch.float32)):
+            out = backbone(x)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        times.append(time.perf_counter() - t)
+        del out
+    after = dynamo_counters()
+    try:
+        import torch._inductor.config as inductor_config
+
+        rblock = bool(inductor_config.dynamic_scale_rblock)
+    except Exception:  # noqa: BLE001
+        rblock = None
+    return {
+        "batch": batch,
+        "input_shape": list(x.shape),
+        "first_call_s": times[0],
+        "later_calls_ms": [t * 1000.0 for t in times[1:]],
+        "warmup_total_s": sum(times),
+        "dynamo_before": before,
+        "dynamo_after": after,
+        "inductor_cache_dir": os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
+        "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR"),
+        "env_dynamic_scale_rblock": os.environ.get(
+            "TORCHINDUCTOR_DYNAMIC_SCALE_RBLOCK"
+        ),
+        "global_config_dynamic_scale_rblock": rblock,
+        "env_deterministic": os.environ.get("TORCHINDUCTOR_DETERMINISTIC"),
+    }
 
 
 def trim_for_stage(predictor, stage: str) -> None:
@@ -1372,7 +1551,15 @@ def _p2_main(settings, q12, q23, taken, slots, ctrl, stop):
         camera_mode = getattr(predictor.model, "camera_mode", "weak_perspective")
         config = stage_config_from_settings(settings, camera_mode)
         head = HeadStage(predictor, config)
-        ctrl.put(("ready", "head", os.getpid(), load_ms, camera_mode, _cuda_mem()))
+        backbone = {
+            "setup": getattr(predictor, "backbone_setup", None),
+            "warmup": warm_backbone(predictor)
+            if settings.get("backbone_warmup", True)
+            else None,
+        }
+        ctrl.put(
+            ("ready", "head", os.getpid(), load_ms, camera_mode, _cuda_mem(), backbone)
+        )
         while True:
             item = _mp_get(q12, stop)
             if isinstance(item, tuple) and item and item[0] == _END:
@@ -1417,7 +1604,7 @@ def _p2_main(settings, q12, q23, taken, slots, ctrl, stop):
                         os.unlink(clip.crops_path)
             clip.times["s2_end"] = time.time()
             _mp_put(q23, ("end", clip.light(), None), stop)
-        ctrl.put(("done", "head", _cuda_mem()))
+        ctrl.put(("done", "head", _cuda_mem(), dynamo_counters()))
     except _Stopped:
         pass
     except BaseException as exc:  # noqa: BLE001
@@ -1437,7 +1624,10 @@ def _p3_main(settings, q23, slots, ctrl, stop):
     _proc_setup(settings, "t3-p3")
     try:
         make = _factory(settings, "predictor")
-        predictor, load_ms = (make or load_predictor)(settings)
+        # P3 drops the backbone: do not prepare or compile it here.
+        predictor, load_ms = (make or load_predictor)(
+            without_backbone_options(settings)
+        )
         if settings.get("trim_models", True):
             trim_for_stage(predictor, "soma")
         camera_mode = getattr(predictor.model, "camera_mode", "weak_perspective")
@@ -1577,6 +1767,7 @@ def run_process_pipeline(
                     if len(message) > 5
                     else {"warmup": message[4]}
                 ),
+                **({"backbone": message[6]} if len(message) > 6 else {}),
                 "epoch": time.time(),
             }
         elif kind == "done":

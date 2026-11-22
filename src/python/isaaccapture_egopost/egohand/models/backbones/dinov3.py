@@ -99,21 +99,62 @@ class DinoV3Backbone(nn.Module):
         # ModuleList, state_dict, and training paths remain unchanged. They are
         # created lazily by an eligible inference call.
         self._compiled_blocks = None
+        # Inference-only options (all off by default; see the methods below).
+        self._compile_scope = "block"
+        self._compile_options = None
+        self._compile_backend = "inductor"
+        self._compiled_whole = None
 
-    def enable_full_batch_compile(self, full_batch_size: int) -> None:
-        """Compile DINO blocks only for eval/no-grad batches of this exact size."""
+    def enable_full_batch_compile(
+        self,
+        full_batch_size: int,
+        scope: str = "block",
+        options: dict | None = None,
+        backend: str = "inductor",
+    ) -> None:
+        """Compile the backbone only for eval/no-grad batches of this exact size.
+
+        Args:
+            full_batch_size: Batch size that takes the compiled path; every
+                other batch size (tail batches) stays eager.
+            scope: ``"block"`` compiles each of the 32 blocks separately (the
+                original ``--dino_compile``); ``"whole"`` compiles one graph from
+                the patch embedding to the final norm (same math as
+                ``get_intermediate_layers(n=1, reshape=True, norm=True)``).
+            options: Inductor options passed to ``torch.compile`` instead of
+                ``mode="default"`` (the two cannot be combined), e.g.
+                ``{"dynamic_scale_rblock": False}``. ``None`` keeps the original
+                call.
+            backend: ``torch.compile`` backend (tests use ``"eager"``).
+        """
         if isinstance(full_batch_size, bool) or not isinstance(full_batch_size, int):
             raise TypeError("full_batch_size must be an integer")
         if full_batch_size <= 0:
             raise ValueError("full_batch_size must be positive")
-        if (
-            self._compiled_blocks is not None
-            and self._compiled_full_batch_size != full_batch_size
+        if scope not in ("block", "whole"):
+            raise ValueError(f"scope must be 'block' or 'whole', got {scope!r}")
+        built = self._compiled_blocks is not None or self._compiled_whole is not None
+        if built and (
+            self._compiled_full_batch_size != full_batch_size
+            or self._compile_scope != scope
+            or self._compile_options != options
+            or self._compile_backend != backend
         ):
             raise RuntimeError(
-                "cannot change full_batch_size after compiled wrappers are created"
+                "cannot change the compile settings after compiled wrappers are created"
             )
         self._compiled_full_batch_size = full_batch_size
+        self._compile_scope = scope
+        self._compile_options = dict(options) if options is not None else None
+        self._compile_backend = backend
+
+    def _compile_kwargs(self) -> dict:
+        kwargs = dict(backend=self._compile_backend, fullgraph=True, dynamic=False)
+        if self._compile_options is not None:
+            kwargs["options"] = dict(self._compile_options)
+        elif self._compile_backend == "inductor":
+            kwargs["mode"] = "default"
+        return kwargs
 
     def _ensure_inference_compiled_blocks(self):
         if self._compiled_blocks is None:
@@ -122,19 +163,33 @@ class DinoV3Backbone(nn.Module):
                 f"for B={self._compiled_full_batch_size}"
             )
             self._compiled_blocks = [
-                torch.compile(
-                    block,
-                    backend="inductor",
-                    fullgraph=True,
-                    dynamic=False,
-                    mode="default",
-                )
+                torch.compile(block, **self._compile_kwargs())
                 for block in self.encoder.blocks
             ]
         return self._compiled_blocks
 
+    def _ensure_inference_compiled_whole(self):
+        if self._compiled_whole is None:
+            Log.info(
+                "[DinoV3Backbone] Building eval-only static compiled backbone "
+                f"(one graph) for B={self._compiled_full_batch_size}"
+            )
+            self._compiled_whole = torch.compile(
+                self._eager_spatial_features, **self._compile_kwargs()
+            )
+        return self._compiled_whole
+
+    def _eager_spatial_features(self, x: torch.Tensor) -> torch.Tensor:
+        """``_spatial_features`` over the plain blocks (compiled as one graph)."""
+        return self._spatial_features(x, self.encoder.blocks)
+
     def _forward_compiled_spatial_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Run the exact get_intermediate_layers(n=1) contract via compiled blocks."""
+        """Run the exact get_intermediate_layers(n=1) contract via compiled code."""
+        if self._compile_scope == "whole":
+            return self._ensure_inference_compiled_whole()(x)
+        return self._spatial_features(x, self._ensure_inference_compiled_blocks())
+
+    def _spatial_features(self, x: torch.Tensor, blocks) -> torch.Tensor:
         encoder = self.encoder
         tokens, (height, width) = encoder.prepare_tokens_with_masks(x)
         rope = (
@@ -142,7 +197,7 @@ class DinoV3Backbone(nn.Module):
             if encoder.rope_embed is not None
             else None
         )
-        for block in self._ensure_inference_compiled_blocks():
+        for block in blocks:
             tokens = block(tokens, rope)
 
         special_count = encoder.n_storage_tokens + 1
@@ -161,6 +216,35 @@ class DinoV3Backbone(nn.Module):
         Returns:
             (B, embed_dim, H/16, W/16) feature map (CLS + storage tokens dropped).
         """
+        return self._forward_impl(x)
+
+    # ------------------------------------------------------------------
+    # Inference-only weight preparation (never used by training configs).
+
+    def cast_matmul_weights_bf16(self) -> int:
+        """Store the weights autocast would cast to bf16 anyway in bf16, once.
+
+        Under ``torch.autocast(dtype=torch.bfloat16)`` every ``nn.Linear`` and
+        ``nn.Conv2d`` casts its fp32 weight and bias to bf16 on each call; doing
+        that cast once at load gives the same bf16 values (round to nearest
+        even), so the forward under autocast computes the same thing without
+        the per-call cast kernels and with half the weight memory. Norms,
+        layerscale, tokens and RoPE stay fp32, as autocast runs them.
+        Inference only: the fp32 master weights are gone afterwards.
+
+        Returns:
+            Number of modules converted.
+        """
+        count = 0
+        for module in self.encoder.modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                module.weight.data = module.weight.data.to(torch.bfloat16)
+                if module.bias is not None:
+                    module.bias.data = module.bias.data.to(torch.bfloat16)
+                count += 1
+        return count
+
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         use_compiled = (
             self._compiled_full_batch_size is not None
             and x.shape[0] == self._compiled_full_batch_size

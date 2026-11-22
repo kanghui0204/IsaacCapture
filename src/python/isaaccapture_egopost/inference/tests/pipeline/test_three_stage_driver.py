@@ -42,11 +42,14 @@ def _cli_args(monkeypatch, drv, *extra):
 
 def test_supported_arguments_pass(monkeypatch, driver):
     driver.check_supported(_cli_args(monkeypatch, driver))
+    # --dino_compile is --backbone_compile block (compiled and warmed up
+    # before the queue starts).
+    driver.check_supported(_cli_args(monkeypatch, driver, "--dino_compile"))
 
 
 @pytest.mark.parametrize(
     "extra",
-    [["--dino_compile"], ["--save_npzs"], ["--frame_batch_size", "64"]],
+    [["--save_npzs"], ["--frame_batch_size", "64"]],
 )
 def test_unsupported_arguments_are_invalid_input(monkeypatch, capsys, driver, extra):
     args = _cli_args(monkeypatch, driver, *extra)

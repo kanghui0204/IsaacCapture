@@ -109,7 +109,11 @@ def parse_args(argv=None, *, epilog: str | None = None):
         "the eager path. Use for throughput-sensitive batch inference where "
         "most batches are full-size (e.g. long videos); skip it for small "
         "one-off runs, since torch.compile warm-up cost may exceed the "
-        "savings. Off by default, so it has no effect unless passed.",
+        "savings. Off by default, so it has no effect unless passed. Compiles "
+        'with mode="default": Inductor picks some reduction block sizes by '
+        "timing, so processes cold-compiling at the same time on one GPU can "
+        "give slightly different outputs (run_egohand_three_stage.py "
+        "--backbone_compile compiles deterministically).",
     )
     p.add_argument(
         "--soma_batch_size",

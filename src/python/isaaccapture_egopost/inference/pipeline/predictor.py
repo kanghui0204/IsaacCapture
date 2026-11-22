@@ -362,6 +362,25 @@ class EgoHandPredictor:
             )
         enable_compile(self.batch_size)
 
+    def enable_backbone_compile(
+        self, scope: str = "block", options: dict | None = None
+    ) -> None:
+        """Compile the DINO backbone for full batches: per block or as one graph.
+
+        ``scope="block"`` with ``options=None`` is ``enable_dino_compile``.
+        ``options`` are Inductor options used instead of ``mode="default"``.
+        """
+        if scope == "block" and options is None:
+            self.enable_dino_compile()
+            return
+        backbone = getattr(self.model, "backbone", None)
+        enable_compile = getattr(backbone, "enable_full_batch_compile", None)
+        if enable_compile is None:
+            raise RuntimeError(
+                "DINO compilation requires a DINOv3 backbone with compile support"
+            )
+        enable_compile(self.batch_size, scope=scope, options=options)
+
     @classmethod
     def from_checkpoint(
         cls,
