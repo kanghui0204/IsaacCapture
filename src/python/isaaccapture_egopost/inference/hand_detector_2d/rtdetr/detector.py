@@ -30,6 +30,8 @@ detector, which is exactly the double-padding trap this note exists to flag.
 import dataclasses
 import json
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from math import log1p
 from pathlib import Path
 
@@ -52,6 +54,10 @@ log = logging.getLogger(__name__)
 
 DEFAULT_SCORE_THR = 0.5
 DEFAULT_BATCH_SIZE = 8
+# Threads for the per-frame CPU preprocessing (cvtColor, PIL resize to 640). Pillow
+# and OpenCV release the GIL in these calls, so frames are resized in parallel; the
+# same per-frame function runs either way, so the network input is unchanged.
+DEFAULT_PREPROCESS_THREADS = 8
 # Reject boxes whose side is at most one pixel.
 MIN_VALID_BOX_SIZE = 1.0
 
@@ -253,6 +259,10 @@ class RTDetrHandBBoxDetector:
         providers: Explicit onnxruntime providers, overriding ``device``.
         smoothing: Optional native-track post-filter. Requires complete clips
             and frame timestamps in run().
+        preprocess_threads: Threads that preprocess frames (BGR->RGB, PIL
+            resize to 640) while ONNX Runtime runs the previous batch. ``None``
+            uses ``min(DEFAULT_PREPROCESS_THREADS, os.cpu_count())``; 1 runs the
+            original sequential loop. The network input is identical either way.
     """
 
     # run() writes to output_paths_per_hand when given one.
@@ -272,6 +282,7 @@ class RTDetrHandBBoxDetector:
         drop_gap_filled: bool = False,
         providers: list | None = None,
         smoothing: BBoxSmoothingConfig | None = None,
+        preprocess_threads: int | None = None,
     ):
         if smoothing is not None and not use_tracker:
             raise ValueError("BBox smoothing requires use_tracker=True")
@@ -286,6 +297,11 @@ class RTDetrHandBBoxDetector:
         from .onnx_model import HandDetector
 
         self.batch_size = max(1, int(batch_size))
+        if preprocess_threads is None:
+            preprocess_threads = min(DEFAULT_PREPROCESS_THREADS, os.cpu_count() or 1)
+        self.preprocess_threads = max(1, int(preprocess_threads))
+        # ORT batch sizes already run by this session (cuDNN algorithms chosen).
+        self._ort_batch_sizes_run: set[int] = set()
         self.padding = padding
         self.use_tracker = use_tracker
         self.enforce_lr_order = enforce_lr_order
@@ -382,9 +398,25 @@ class RTDetrHandBBoxDetector:
         return self._detect_per_frame(images_bgr)
 
     def _detect_per_frame(self, images_bgr) -> list:
-        """Run the ONNX detector over every frame, in ``batch_size`` chunks."""
+        """Run the ONNX detector over every frame, in ``batch_size`` chunks.
+
+        With ``preprocess_threads > 1`` a thread pool preprocesses the frames of
+        chunk i+1 while ONNX Runtime runs chunk i (``session.run`` releases the
+        GIL). Every frame still goes through the same per-frame function and the
+        chunks are the same ``batch_size`` slices, so the ORT batches are
+        byte-identical to the sequential loop. An ORT wrapper without
+        ``detect_preprocessed`` (e.g. a test double with only ``detect_batch``)
+        keeps the sequential loop.
+        """
         import cv2
         from PIL import Image
+
+        if (
+            self.preprocess_threads > 1
+            and len(images_bgr) > 0
+            and hasattr(self.detector, "detect_preprocessed")
+        ):
+            return self._detect_per_frame_threaded(images_bgr)
 
         detections = []
         for start in range(0, len(images_bgr), self.batch_size):
@@ -396,6 +428,57 @@ class RTDetrHandBBoxDetector:
                 for image in chunk
             ]
             detections.extend(self.detector.detect_batch(pil_chunk))
+        return detections
+
+    def _detect_per_frame_threaded(self, images_bgr) -> list:
+        """``_detect_per_frame`` with preprocessing in a pool, one chunk ahead."""
+        from .onnx_model import HandDetector
+
+        import cv2
+        from PIL import Image
+
+        def frame_input(image):
+            # The sequential path's calls for one frame: cvtColor -> fromarray
+            # (above), then HandDetector._preprocess (detect_batch).
+            pil = Image.fromarray(
+                cv2.cvtColor(np.ascontiguousarray(image), cv2.COLOR_BGR2RGB)
+            )
+            return HandDetector._preprocess(pil), pil.size
+
+        chunks = [
+            images_bgr[start : start + self.batch_size]
+            for start in range(0, len(images_bgr), self.batch_size)
+        ]
+        # ORT picks cuDNN algorithms by timing them the first time it sees a
+        # batch size; that run gets the machine to itself, as in the
+        # sequential loop.
+        seen = self._ort_batch_sizes_run
+        detections = []
+        with ThreadPoolExecutor(
+            max_workers=self.preprocess_threads, thread_name_prefix="rtdetr-pre"
+        ) as pool:
+
+            def submit(chunk):
+                return [pool.submit(frame_input, image) for image in chunk]
+
+            pending = submit(chunks[0])
+            for index in range(len(chunks)):
+                prepared = [future.result() for future in pending]
+                has_next = index + 1 < len(chunks)
+                first_run = len(prepared) not in seen
+                if has_next and not first_run:
+                    pending = submit(
+                        chunks[index + 1]
+                    )  # runs while ORT runs this chunk
+                sizes = np.array([size for _, size in prepared], dtype=np.int64)
+                detections.extend(
+                    self.detector.detect_preprocessed(
+                        [array for array, _ in prepared], sizes
+                    )
+                )
+                seen.add(len(prepared))
+                if has_next and first_run:
+                    pending = submit(chunks[index + 1])
         return detections
 
     def run(
@@ -568,6 +651,9 @@ class RTDetrConfig:
         bbox_size_alpha_shrink: Shrink EMA weight at 20 fps, in (0, 1].
         bbox_max_size_change: Maximum fractional growth per 20-fps interval.
             Contraction uses the reciprocal ratio; resets are exempt.
+        preprocess_threads: Threads for the per-frame CPU preprocessing, run
+            one batch ahead of ONNX Runtime. None = min(8, CPU count); 1 = the
+            sequential loop. Does not change the detections.
     """
 
     weights: str | None = None
@@ -582,6 +668,7 @@ class RTDetrConfig:
     bbox_size_alpha_grow: float = 0.12
     bbox_size_alpha_shrink: float = 0.06
     bbox_max_size_change: float = 0.01
+    preprocess_threads: int | None = None
 
     @classmethod
     def from_spec(cls, spec: str) -> "RTDetrConfig":
@@ -643,6 +730,13 @@ class RTDetrConfig:
         config.smoothing_config()
         if config.batch_size < 1:
             raise ValueError(f"{prefix} batch_size={config.batch_size} must be >= 1")
+        threads = config.preprocess_threads
+        if threads is not None and (
+            isinstance(threads, bool) or not isinstance(threads, int) or threads < 1
+        ):
+            raise ValueError(
+                f"{prefix} preprocess_threads={threads!r} must be an integer >= 1"
+            )
 
     @staticmethod
     def _coerce(key: str, raw: str, annotation):
@@ -724,4 +818,5 @@ class RTDetrConfig:
             enforce_lr_order=self.lr_order,
             drop_gap_filled=self.drop_gap_filled,
             smoothing=self.smoothing_config() if self.bbox_smoothing else None,
+            preprocess_threads=self.preprocess_threads,
         )

@@ -302,6 +302,17 @@ class HandDetector:
         w, h = img.size
         return self._run(self._preprocess(img), np.array([[w, h]], dtype=np.int64))[0]
 
+    def detect_preprocessed(
+        self, inputs: list[np.ndarray], sizes: np.ndarray
+    ) -> list[list[Detection]]:
+        """``detect_batch`` on inputs already made by ``_preprocess``.
+
+        Args:
+            inputs: One ``(1, 3, 640, 640)`` float32 array per image, in order.
+            sizes: int64 ``(B, 2)`` original ``(width, height)`` per image.
+        """
+        return self._run(np.concatenate(inputs, axis=0), sizes)
+
     def detect_batch(self, images: list) -> list[list[Detection]]:
         """Detect on several images at once.
 
