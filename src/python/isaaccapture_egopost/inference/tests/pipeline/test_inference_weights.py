@@ -1,16 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-OpenMDW-1.1
 
-"""Inference-weight export, strict key checks and meta-device DINO."""
+"""Inference-weight export, strict key checks, meta-device DINO and background load."""
 
 from __future__ import annotations
 
+import gc
 import json
+import sys
+import threading
+import weakref
 
 import pytest
 import torch
 
 from inference.pipeline import inference_weights as iw
+from inference.pipeline.predictor import EgoHandPredictor, PendingEgoHandPredictor
 
 
 def _fake_checkpoint(path):
@@ -122,6 +127,100 @@ def test_dino_meta_init_allocates_no_storage_and_materializes_on_demand():
     assert not any(t.is_meta for t in backbone.encoder.state_dict().values())
 
 
+def test_pending_predictor_serves_settings_without_waiting_and_forwards_after_load():
+    release = threading.Event()
+
+    class _Loaded:
+        model = "loaded-model"
+
+        def run(self):
+            return "ran"
+
+    def load():
+        release.wait(5)
+        return _Loaded()
+
+    pending = PendingEgoHandPredictor(
+        load,
+        batch_size=7,
+        device="cpu",
+        dtype=torch.float32,
+        smooth=True,
+        camera_mode="sam3db_perspective",
+    )
+    # Construction-time settings never block on the load.
+    assert pending.batch_size == 7
+    assert pending.smooth is True
+    assert pending.camera_mode == "sam3db_perspective"
+    assert pending.load_seconds is None
+    release.set()
+    assert pending.run() == "ran"
+    assert pending.model == "loaded-model"
+    assert pending.load_seconds is not None
+
+
+def test_pending_predictor_reraises_load_errors_on_use():
+    def load():
+        raise RuntimeError("bad checkpoint")
+
+    pending = PendingEgoHandPredictor(
+        load,
+        batch_size=1,
+        device="cpu",
+        dtype=torch.float32,
+        smooth=False,
+        camera_mode="weak_perspective",
+    )
+    with pytest.raises(RuntimeError, match="bad checkpoint"):
+        pending.run()
+
+
+def test_load_in_background_rejects_unsupported_target_immediately(tmp_path):
+    ckpt = tmp_path / "model.ckpt"
+    torch.save(
+        {
+            "hyper_parameters": {"cfg": {"_target_": "gep.gep_hand2.GEPHand2"}},
+            "state_dict": {},
+        },
+        ckpt,
+    )
+    with pytest.raises(ValueError, match="not supported"):
+        EgoHandPredictor.load_in_background(ckpt, tmp_path, batch_size=1, device="cpu")
+
+
+def test_background_model_load_is_default_and_can_be_disabled(monkeypatch):
+    from inference.scripts.run_egohand_inference_pipeline import parse_args
+
+    argv = ["x.py", "--input", "in.mp4", "--output_dir", "out"]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert parse_args().background_model_load is True
+    monkeypatch.setattr(sys, "argv", argv + ["--no-background_model_load"])
+    assert parse_args().background_model_load is False
+
+
+def test_pending_predictor_reports_key_check_failure_before_loading():
+    loaded = threading.Event()
+
+    def validate():
+        raise RuntimeError("checkpoint does not match: 3 missing key(s)")
+
+    def load():  # pragma: no cover - must not run
+        loaded.set()
+
+    pending = PendingEgoHandPredictor(
+        load,
+        validate=validate,
+        batch_size=1,
+        device="cpu",
+        dtype=torch.float32,
+        smooth=False,
+        camera_mode="weak_perspective",
+    )
+    with pytest.raises(RuntimeError, match="3 missing key"):
+        pending.wait_until_validated()
+    assert not loaded.is_set()
+
+
 def test_expected_keys_match_a_real_model_without_soma():
     pytest.importorskip("dinov3")
     pytest.importorskip("soma")
@@ -175,3 +274,89 @@ def test_export_verify_handles_scalar_and_strided_tensors(tmp_path):
     )
     iw.export_inference_weights(ckpt, tmp_path / "export", source_sha256=False)
     _verify(ckpt, tmp_path / "export", None)
+
+
+def test_load_in_background_imports_usd_before_starting_the_worker(
+    tmp_path, monkeypatch
+):
+    """OpenUSD dlopen + GIL vs. loader lock: import it while only one thread runs."""
+    from inference.pipeline import predictor as predictor_module
+
+    ckpt = tmp_path / "model.ckpt"
+    _fake_checkpoint(ckpt)
+    events = []
+    real_start = threading.Thread.start
+
+    def start(thread):
+        if thread.name == "egohand-model-load":
+            events.append("worker start")
+        return real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    monkeypatch.setattr(
+        predictor_module, "preload_usd_libraries", lambda: events.append("usd import")
+    )
+    monkeypatch.setattr(
+        predictor_module, "check_checkpoint_keys", lambda source, cfg: None
+    )
+    monkeypatch.setattr(
+        EgoHandPredictor, "from_checkpoint", classmethod(lambda cls, **kw: None)
+    )
+    pending = EgoHandPredictor.load_in_background(
+        ckpt, tmp_path, batch_size=1, device="cpu"
+    )
+    pending.wait_until_validated()
+    pending._done.wait()
+    assert events == ["usd import", "worker start"]
+
+
+def test_load_in_background_passes_on_every_from_checkpoint_argument(
+    tmp_path, monkeypatch
+):
+    """Arguments added to from_checkpoint later reach it through the background
+    path too, and a finished load is not kept alive by the module."""
+    from inference.pipeline import predictor as predictor_module
+
+    ckpt = tmp_path / "model.ckpt"
+    _fake_checkpoint(ckpt)
+    seen = {}
+
+    class Loaded:
+        pass
+
+    def from_checkpoint(cls, **kwargs):
+        seen.update(kwargs)
+        return Loaded()
+
+    monkeypatch.setattr(
+        predictor_module, "check_checkpoint_keys", lambda source, cfg: None
+    )
+    monkeypatch.setattr(
+        EgoHandPredictor, "from_checkpoint", classmethod(from_checkpoint)
+    )
+    pending = EgoHandPredictor.load_in_background(
+        ckpt,
+        tmp_path,
+        batch_size=4,
+        device="cpu",
+        use_perspective_cropping=True,
+        some_future_option=7,
+    )
+    loaded = pending.result()
+    assert seen["batch_size"] == 4 and seen["device"] == "cpu"
+    assert seen["use_perspective_cropping"] is True
+    assert seen["some_future_option"] == 7
+    pending._thread.join()
+    assert pending not in predictor_module._PENDING_LOADS
+    ref = weakref.ref(loaded)
+    del pending, loaded
+    gc.collect()
+    assert ref() is None
+
+
+def test_preload_usd_libraries_imports_what_soma_uses():
+    pytest.importorskip("pxr")
+    from inference.pipeline.predictor import _USD_MODULES, preload_usd_libraries
+
+    preload_usd_libraries()
+    assert all(name in sys.modules for name in _USD_MODULES)

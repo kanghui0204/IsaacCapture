@@ -699,11 +699,8 @@ def main():
             f"{args.soma_hand_assets}"
         )
 
-    print(
-        f"[infer_video] loading EgoHand model + {backend} detector (config: {args.bbox_detector_config}) ..."
-    )
-    t0 = time.perf_counter()
-    predictor = EgoHandPredictor.from_checkpoint(
+    # One set of from_checkpoint arguments for both load paths.
+    load_kwargs = dict(
         egohand_ckpt_path=args.egohand_ckpt,
         soma_hand_data_folder=args.soma_hand_assets,
         batch_size=args.batch_size,
@@ -712,14 +709,40 @@ def main():
         smooth=args.postprocessing_smooth,
         use_perspective_cropping=use_perspective_cropping,
     )
+    if args.background_model_load:
+        print(
+            f"[infer_video] loading EgoHand model in the background + {backend} detector "
+            f"(config: {args.bbox_detector_config}) ..."
+        )
+        # The cfg is read here (fail fast); model construction and tensor
+        # reads overlap decoding and 2D detection.
+        predictor = EgoHandPredictor.load_in_background(
+            **load_kwargs, dino_compile=args.dino_compile
+        )
+        model_load_ms = None  # known once the worker finishes
+    else:
+        print(
+            f"[infer_video] loading EgoHand model + {backend} detector (config: {args.bbox_detector_config}) ..."
+        )
+        t0 = time.perf_counter()
+        predictor = EgoHandPredictor.from_checkpoint(**load_kwargs)
+        if args.dino_compile:
+            predictor.enable_dino_compile()
+        model_load_ms = (time.perf_counter() - t0) * 1000
     if args.dino_compile:
-        predictor.enable_dino_compile()
         print(
             "[infer_video] DINO per-block compilation enabled: "
             f"full batch {args.batch_size}; training, gradients, and partial "
             "batches use eager"
         )
-    model_load_ms = (time.perf_counter() - t0) * 1000
+    if args.background_model_load:
+        # Checkpoint key set (names only) before any frame is decoded, so a
+        # mismatched checkpoint fails before outputs are written.
+        key_check_wait_s = predictor.wait_until_validated()
+        print(
+            f"[infer_video] checkpoint keys checked ({predictor.validate_seconds:.2f} s "
+            f"on the loader thread, waited {key_check_wait_s:.2f} s)"
+        )
 
     pipeline = EgoHandInferencePipeline(
         predictor=predictor, bbox_detector=bbox_detector
@@ -729,7 +752,7 @@ def main():
     save_videos = not args.no_save_videos
     write_soma_npzs = args.save_npzs
 
-    camera_mode = getattr(predictor.model, "camera_mode", "weak_perspective")
+    camera_mode = predictor.camera_mode
     print(f"[infer_video] checkpoint camera_mode={camera_mode}")
     if args.postprocessing_smooth:
         print(
@@ -766,7 +789,8 @@ def main():
                     "perspective_cropping": use_perspective_cropping,
                 },
             )
-            perf_reporter.record_latency(PerfStage.MODEL_LOAD, model_load_ms)
+            if model_load_ms is not None:
+                perf_reporter.record_latency(PerfStage.MODEL_LOAD, model_load_ms)
             pipeline.perf_reporter = perf_reporter
             predictor.perf_reporter = perf_reporter
 
@@ -880,6 +904,15 @@ def main():
             source_camera=source_camera if undistort_maps is not None else None,
         )
 
+        if model_load_ms is None and predictor.load_seconds is not None:
+            # Background load: report the worker's own duration once known,
+            # and how long the main thread actually waited for it.
+            model_load_ms = predictor.load_seconds * 1000
+            perf_reporter.record_latency(PerfStage.MODEL_LOAD, model_load_ms)
+            print(
+                f"[infer_video] background model load: {predictor.load_seconds:.2f} s "
+                f"on the loader thread; main thread waited {predictor.wait_seconds:.2f} s"
+            )
         if not args.perf_output or video_path == videos[-1]:
             out = perf_reporter.write()
             print(f"[infer_video] perf results written to {out}")
@@ -887,5 +920,44 @@ def main():
     print(f"\n[infer_video] all done. results in {output_dir}")
 
 
+#: How long a failing run waits for a background model load before it exits anyway.
+BACKGROUND_LOAD_EXIT_WAIT_S = 300.0
+
+
+def run_main(main_fn=None, wait_s=None):
+    """``main()``; an exception (or exit) while the model still loads in the
+    background first waits for that load (``wait_for_background_loads``), so
+    the exception then ends the process normally: traceback, status 1 (or the
+    SystemExit status), no abort and no core dump. If the load does not finish
+    within ``BACKGROUND_LOAD_EXIT_WAIT_S``, the traceback is printed here and the
+    process ends with ``os._exit`` and the same status."""
+    import traceback
+
+    from inference.pipeline.predictor import wait_for_background_loads
+
+    try:
+        (main_fn or main)()
+    except BaseException as exc:
+        if wait_for_background_loads(
+            BACKGROUND_LOAD_EXIT_WAIT_S if wait_s is None else wait_s
+        ):
+            raise
+        if isinstance(exc, SystemExit):
+            code = exc.code
+            if isinstance(code, str):
+                print(code, file=sys.stderr)
+            status = code if isinstance(code, int) else (0 if code is None else 1)
+        else:
+            traceback.print_exc()
+            status = 1
+        print(
+            "[infer_video] the background model load did not finish; exiting without waiting for it",
+            file=sys.stderr,
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(status)
+
+
 if __name__ == "__main__":
-    main()
+    run_main()

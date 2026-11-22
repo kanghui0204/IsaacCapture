@@ -41,6 +41,15 @@ def parse_args(argv=None, *, epilog: str | None = None):
         "pass an explicit path to use a local checkpoint instead.",
     )
     p.add_argument(
+        "--background_model_load",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Load the EgoHand checkpoint on a worker thread while frames are "
+        "decoded and 2D boxes detected; the first EgoHand forward waits for it. "
+        "Results are unchanged. Default: on. Pass --no-background_model_load "
+        "to load before detection (previous behavior).",
+    )
+    p.add_argument(
         "--egohand_ckpt_hf_path",
         default="egohand_s060000.ckpt",
         help="Filename within the nvidia/EgoHand-v1 HF repo to fetch for --egohand_ckpt's "

@@ -9,6 +9,8 @@ Owns the full model lifecycle for inference:
 - ``EgoHandPredictor``: owns one loaded model, runs batched crop-and-forward loops,
   and writes soma.io-compatible prediction files.
 - ``EgoHandPredictor.from_checkpoint``: convenience factory that combines both steps.
+- ``EgoHandPredictor.load_in_background``: the same on a worker thread
+  (``PendingEgoHandPredictor``), so loading overlaps decoding and detection.
 
 ``run()`` returns the per-frame result dict schema consumed by the SOMA NPZ writer.
 Optional perspective cropping maps each detected hand region to a virtual pinhole
@@ -36,6 +38,7 @@ from inference.perf import PerfReporter, PerfStage
 from inference.pipeline.crop_stream import StreamedCropBatches
 from inference.pipeline.inference_weights import (
     CheckpointSource,
+    check_checkpoint_keys,
     check_state_dict_keys,
     read_checkpoint,
 )
@@ -167,6 +170,31 @@ def load_egohand_model(
     return model.eval(), target
 
 
+#: OpenUSD modules that py-soma-x imports (``soma.io``) during model construction.
+_USD_MODULES = ("pxr.Gf", "pxr.Sdf", "pxr.Usd", "pxr.UsdGeom", "pxr.UsdSkel", "pxr.Vt")
+
+
+def preload_usd_libraries() -> None:
+    """Import OpenUSD on the calling thread before any worker thread starts.
+
+    OpenUSD's shared libraries take the GIL in their static initializers, which
+    run inside ``dlopen`` while glibc's loader lock is held. A thread that holds
+    the GIL and needs the same loader lock -- a thread's first use of a C++
+    ``thread_local`` with a destructor (``__cxa_thread_atexit``), e.g. a decode
+    thread's first ``torch.device`` -- then deadlocks with a background model
+    load that is importing ``soma``. Importing these modules first, while only
+    one thread runs, removes the window (about 0.2 s). Without OpenUSD
+    installed this does nothing.
+    """
+    import importlib
+
+    for name in _USD_MODULES:
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            return
+
+
 class EgoHandPredictor:
     """Run bbox-conditioned predictions with an already-loaded EgoHand model.
 
@@ -244,6 +272,73 @@ class EgoHandPredictor:
         right_joint_names = list(self.model.soma_hand.right.rig_data["joint_names"])
         paired_names = ["Root"] + left_joint_names + right_joint_names
         self._pose_mirror = PoseMirror_SOMA(paired_names, root_name="Root")
+
+    @property
+    def camera_mode(self) -> str:
+        """Camera parameterization of the loaded checkpoint."""
+        return getattr(self.model, "camera_mode", "weak_perspective")
+
+    @classmethod
+    def load_in_background(
+        cls,
+        egohand_ckpt_path: str | Path,
+        soma_hand_data_folder: str | Path,
+        batch_size: int,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float32,
+        smooth: bool = False,
+        dino_compile: bool = False,
+        **from_checkpoint_kwargs,
+    ) -> "PendingEgoHandPredictor":
+        """Start ``from_checkpoint`` on a worker thread and return immediately.
+
+        The checkpoint cfg is read (and its ``_target_`` validated) on the
+        calling thread so configuration errors still fail fast; building the
+        model and reading the tensors overlap whatever the caller does next,
+        typically video decoding and 2D detection. The worker first checks the
+        checkpoint's key set (``wait_until_validated``).
+
+        Takes the arguments of ``from_checkpoint`` (every keyword not listed
+        here is passed on unchanged) plus ``dino_compile``.
+        """
+        source = read_checkpoint(egohand_ckpt_path)
+        cfg, _ = _validated_cfg(source, soma_hand_data_folder)
+        try:
+            import warp as wp
+
+            # warp.init() has no lock; initialize on this thread before the
+            # worker's SOMA construction and the detector/crop kernels race.
+            wp.init()
+        except ImportError:
+            pass
+        preload_usd_libraries()
+
+        def validate():
+            check_checkpoint_keys(source, cfg)
+
+        def load():
+            predictor = cls.from_checkpoint(
+                egohand_ckpt_path=source,
+                soma_hand_data_folder=soma_hand_data_folder,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+                smooth=smooth,
+                **from_checkpoint_kwargs,
+            )
+            if dino_compile:
+                predictor.enable_dino_compile()
+            return predictor
+
+        return PendingEgoHandPredictor(
+            load,
+            validate=validate,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+            smooth=smooth,
+            camera_mode=str(cfg.get("camera_mode", "weak_perspective")),
+        )
 
     def enable_dino_compile(self) -> None:
         """Compile full-batch DINO blocks for inference on this predictor."""
@@ -1068,3 +1163,139 @@ class EgoHandPredictor:
                 PerfStage.POST_FORWARD, post_forward_ms_total / frame_count
             )
         return predictions
+
+
+#: PendingEgoHandPredictors of this process whose load is still running (each
+#: worker removes itself when done, so a finished load is not kept alive here).
+_PENDING_LOADS: list = []
+
+
+def wait_for_background_loads(timeout: float) -> bool:
+    """Wait (up to ``timeout`` seconds in total) until every background model
+    load of this process has finished; True when none is still running.
+
+    The loads run on daemon threads. When the main thread ends with an
+    exception while one is still inside native code (checkpoint read, CUDA
+    copies), interpreter shutdown stops that thread there and the process
+    aborts ("terminate called without an active exception", status 134, core
+    dump). Waiting first lets the interpreter shut down normally.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    for pending in _PENDING_LOADS:
+        if not pending._done.wait(max(0.0, deadline - time.monotonic())):
+            return False
+    return True
+
+
+class PendingEgoHandPredictor:
+    """An ``EgoHandPredictor`` that is still loading on a worker thread.
+
+    ``batch_size``, ``device``, ``dtype``, ``smooth`` and ``camera_mode`` are
+    known up front and never block. Any other attribute (``run``, ``model``,
+    ``postprocess_results`` ...) waits for the load to finish and is then
+    served by the loaded predictor; a load failure is re-raised there.
+    ``perf_reporter`` may be set before the load finishes; it is handed to the
+    loaded predictor.
+    """
+
+    def __init__(
+        self, load, *, batch_size, device, dtype, smooth, camera_mode, validate=None
+    ):
+        import threading
+
+        self.batch_size = batch_size
+        self.device = device
+        self.dtype = dtype
+        self.smooth = bool(smooth)
+        self.camera_mode = camera_mode
+        self.load_seconds: float | None = None
+        self.wait_seconds = 0.0
+        self._predictor = None
+        self._error: BaseException | None = None
+        self._done = threading.Event()
+        self._validated = threading.Event()
+        self._validation_error: BaseException | None = None
+        self.validate_seconds: float | None = None
+
+        def worker():
+            start = time.perf_counter()
+            try:
+                try:
+                    if validate is not None:
+                        validate()
+                except BaseException as exc:
+                    self._validation_error = exc
+                    raise
+                finally:
+                    self.validate_seconds = time.perf_counter() - start
+                    self._validated.set()
+                predictor = load()
+                if torch.cuda.is_available() and torch.cuda.is_initialized():
+                    # Count queued weight copies as load time, without
+                    # waiting on other threads' streams.
+                    torch.cuda.current_stream().synchronize()
+                self._predictor = predictor
+            except BaseException as exc:  # re-raised on first use
+                self._error = exc
+            finally:
+                self.load_seconds = time.perf_counter() - start
+                self._done.set()
+                with contextlib.suppress(ValueError):
+                    _PENDING_LOADS.remove(self)
+
+        self._thread = threading.Thread(
+            target=worker, name="egohand-model-load", daemon=True
+        )
+        _PENDING_LOADS.append(self)
+        self._thread.start()
+
+    def wait_until_validated(self) -> float:
+        """Block until the checkpoint key check is done; re-raise its error.
+
+        Callers do this before decoding so a mismatched checkpoint fails
+        before any frame is processed or output written. Returns the seconds
+        spent waiting.
+        """
+        start = time.perf_counter()
+        self._validated.wait()
+        waited = time.perf_counter() - start
+        if self._validation_error is not None:
+            raise self._validation_error
+        return waited
+
+    def result(self) -> EgoHandPredictor:
+        """Block until the predictor is loaded and return it."""
+        if not self._done.is_set():
+            start = time.perf_counter()
+            self._done.wait()
+            self.wait_seconds += time.perf_counter() - start
+        if self._error is not None:
+            raise self._error
+        if "_perf_reporter" in self.__dict__:
+            self._predictor.perf_reporter = self._perf_reporter
+        return self._predictor
+
+    def __setattr__(self, name, value):
+        if name == "perf_reporter":
+            # The command line sets the per-video perf reporter before the
+            # model may have finished loading: keep it and hand it to the
+            # predictor when it is resolved (result()).
+            self.__dict__["_perf_reporter"] = value
+            if self.__dict__.get("_predictor") is not None:
+                self._predictor.perf_reporter = value
+            return
+        super().__setattr__(name, value)
+
+    def __getattr__(self, name):
+        # Only called for attributes not set in __init__.
+        if name.startswith("__") or name in (
+            "_predictor",
+            "_error",
+            "_done",
+            "_thread",
+            "_validated",
+            "_validation_error",
+            "_perf_reporter",
+        ):
+            raise AttributeError(name)
+        return getattr(self.result(), name)
