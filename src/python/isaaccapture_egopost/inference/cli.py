@@ -112,6 +112,17 @@ def parse_args(argv=None, *, epilog: str | None = None):
         "savings. Off by default, so it has no effect unless passed.",
     )
     p.add_argument(
+        "--soma_batch_size",
+        type=int,
+        default=0,
+        help="Run the SOMA hand layer once per this many crops instead of once "
+        "per --batch_size batch: the left-hand layer per soma_batch_size // "
+        "batch_size batches, the right-hand mirror per at most this many right "
+        "hands, each call padded to this size. 0 (default) keeps one call per "
+        "batch. Only float32 rounding changes (batched-product reduction "
+        "order). Must be 0 or at least --batch_size; 512 is a good value.",
+    )
+    p.add_argument(
         "--postprocessing_smooth",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -232,6 +243,8 @@ def parse_args(argv=None, *, epilog: str | None = None):
         p.error("--frame_batch_size must be positive")
     if args.max_seconds is not None and not 0 < args.max_seconds < float("inf"):
         p.error("--max_seconds must be positive and finite")
+    if args.soma_batch_size < 0 or 0 < args.soma_batch_size < args.batch_size:
+        p.error("--soma_batch_size must be 0 or at least --batch_size")
     if not 0 <= args.qc_max_bad_frac <= 1:
         p.error("--qc_max_bad_frac must be between 0 and 1")
     if args.postprocessing_qc:

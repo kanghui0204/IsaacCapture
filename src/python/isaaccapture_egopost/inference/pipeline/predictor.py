@@ -55,6 +55,7 @@ from inference.preprocessing.mirroring import (
     mirror_left_prediction_to_right,
     prepare_right_hand_model_input,
 )
+from inference.pipeline.soma_batching import SomaBatcher
 from inference.postprocessing.adaptive_smoothing import (
     smooth_adaptive_hand_results,
     validate_frame_times,
@@ -214,6 +215,11 @@ class EgoHandPredictor:
             frame timestamps in seconds. ``False`` (default) returns raw output.
         use_perspective_cropping: Use perspective cropping for each hand
             bbox with the source camera's ``project`` and ``unproject`` methods.
+        soma_batch_size: 0 (default) runs the SOMA hand layer once per batch.
+            Otherwise the left layer runs once per ``soma_batch_size //
+            batch_size`` batches and the right-hand mirror once per at most
+            ``soma_batch_size`` right hands, each padded to ``soma_batch_size``
+            rows. Changes only float32 rounding (batched-product reduction order).
     """
 
     # Crop while earlier batches run (see ``inference/pipeline/crop_stream.py``).
@@ -230,8 +236,12 @@ class EgoHandPredictor:
         smooth: bool = False,
         use_perspective_cropping: bool = False,
         perf_reporter: PerfReporter | None = None,
+        soma_batch_size: int = 0,
     ):
+        if soma_batch_size < 0 or 0 < soma_batch_size < batch_size:
+            raise ValueError("soma_batch_size must be 0 or at least batch_size")
         self.batch_size = batch_size
+        self.soma_batch_size = int(soma_batch_size)
         self.device = device
         self.dtype = dtype
         self.smooth = bool(smooth)
@@ -360,6 +370,7 @@ class EgoHandPredictor:
         dtype: torch.dtype = torch.float32,
         smooth: bool = False,
         use_perspective_cropping: bool = False,
+        soma_batch_size: int = 0,
     ) -> "EgoHandPredictor":
         """Load a checkpoint and return a ready-to-use predictor.
 
@@ -377,6 +388,7 @@ class EgoHandPredictor:
             smooth: Enable adaptive parameter smoothing (default off).
             use_perspective_cropping: Use perspective cropping for each
                 hand bbox before inference (default off).
+            soma_batch_size: See the class docstring (default 0).
 
         Returns:
             Predictor owning the loaded checkpoint and inference configuration.
@@ -392,6 +404,7 @@ class EgoHandPredictor:
             dtype=dtype,
             smooth=smooth,
             use_perspective_cropping=use_perspective_cropping,
+            soma_batch_size=soma_batch_size,
         )
 
     @torch.no_grad()
@@ -904,47 +917,17 @@ class EgoHandPredictor:
             Flat list of per-crop result dicts ready for ``results_per_hand``
             assembly and SOMA NPZ writing.
         """
+        if getattr(self, "soma_batch_size", 0) > 0:
+            return self._run_imagebased_predictions_soma(prepared_inputs, frame_count)
         perf_reporter = getattr(self, "perf_reporter", None)
         predictions = []
         # Contiguous, non-overlapping per-batch phases: assembly -> forward -> post-forward.
         batch_assembly_ms_total = 0.0
         forward_ms_total = 0.0
         post_forward_ms_total = 0.0
-        if isinstance(prepared_inputs, StreamedCropBatches):
-            # Batches of valid crops, already uploaded while earlier batches ran.
-            batch_source = ((staged.hand_data, staged) for staged in prepared_inputs)
-        else:
-            batch_source = (
-                (prepared_inputs[start : start + self.batch_size], None)
-                for start in range(0, len(prepared_inputs), self.batch_size)
-            )
-        for batch_hand_data, staged in batch_source:
+        for batch_hand_data, staged in self._batch_source(prepared_inputs):
             batch_assembly_start = time.perf_counter()
-            batch = {
-                "img": staged.images(self.device)
-                if staged is not None
-                else torch.stack([d["crop_tensor"] for d in batch_hand_data]).to(
-                    self.device
-                ),
-                "bbx_xys": torch.from_numpy(
-                    np.stack([d["model_bbx_xys"] for d in batch_hand_data])
-                )
-                .float()
-                .to(self.device),
-                "K_fullimg": torch.from_numpy(
-                    np.stack([d["model_K"] for d in batch_hand_data])
-                )
-                .float()
-                .to(self.device),
-                "img_size": torch.from_numpy(
-                    np.stack([d["model_img_size"] for d in batch_hand_data])
-                )
-                .float()
-                .to(self.device),
-                # Right-hand crops were flipped into the left-hand canonical frame
-                # during preprocessing; the model always sees left-hand inputs.
-                "hand_type": ["left"] * len(batch_hand_data),
-            }
+            batch = self._assemble_batch(batch_hand_data, staged)
             if perf_reporter is not None and self.device != "cpu":
                 # Counted in batch assembly: waits for the host-to-device copies.
                 torch.cuda.synchronize(self.device)
@@ -959,63 +942,10 @@ class EgoHandPredictor:
             post_forward_start = time.perf_counter()
             forward_ms_total += (post_forward_start - forward_start) * 1000
 
-            params = output["pred_hand_params"]
-            # EgoHand packs global_scale into scale_params[:, 0] and per-finger
-            # scale into the tail. Split here so the mirror call and D2H loop
-            # below see consistent shapes.
-            scale_params_raw = params["scale_params"]
-            global_scale_batch = scale_params_raw[:, 0]
-            scale_params_batch = (
-                scale_params_raw[:, 1:] if scale_params_raw.shape[1] > 1 else None
+            params, global_scale_batch, scale_params_batch = self._split_batch_params(
+                output
             )
-
-            if (
-                getattr(self.model, "camera_mode", "weak_perspective")
-                == "weak_perspective"
-            ):
-                output["pred_cam_t"] = compute_transl_full_cam(
-                    output["pred_cam"].float(),
-                    batch["bbx_xys"].float(),
-                    batch["K_fullimg"].float(),
-                )
-                (
-                    output["pred_keypoints_2d"],
-                    output["pred_projection_valid"],
-                ) = project_camera_points_to_crop_with_validity(
-                    output["pred_keypoints_3d"].float()
-                    + output["pred_cam_t"].unsqueeze(1),
-                    batch["K_fullimg"].float(),
-                    batch["bbx_xys"].float(),
-                    min_depth=float(getattr(self.model, "kp2d_min_depth", 1e-4)),
-                )
-
-            pred_camera_points = output["pred_keypoints_3d"].float() + output[
-                "pred_cam_t"
-            ].float().unsqueeze(1)
-            fallback_projection_valid = torch.isfinite(pred_camera_points).all(
-                dim=-1
-            ) & (
-                pred_camera_points[..., 2]
-                > float(
-                    getattr(
-                        self.model,
-                        "kp2d_min_depth",
-                        1e-4,
-                    )
-                )
-            )
-            projection_valid = output.get(
-                "pred_projection_valid",
-                fallback_projection_valid,
-            )
-            projection_valid = projection_valid & torch.isfinite(
-                output["pred_keypoints_2d"]
-            ).all(dim=-1)
-            output["pred_projection_valid"] = projection_valid
-            output["pred_keypoints_2d"] = output["pred_keypoints_2d"].masked_fill(
-                ~projection_valid.unsqueeze(-1),
-                float("nan"),
-            )
+            self._finalize_projection(output, batch)
 
             # Mirror the right-hand sub-batch in one vectorised call. right_indices
             # is a subset of the mixed-hand batch; right_pos gives O(1) lookup back
@@ -1027,126 +957,36 @@ class EgoHandPredictor:
             ]
             right_batched = None
             if right_indices:
-                idx = torch.tensor(right_indices, device=self.device, dtype=torch.long)
                 # Disable any inherited autocast (e.g. from a preceding detector
                 # that uses bfloat16 internally). The MHR identity model uses sparse
                 # CUDA matmul which does not support half precision.
                 with torch.autocast("cuda", enabled=False):
+                    mirror_args = self._right_mirror_inputs(
+                        batch_hand_data,
+                        right_indices,
+                        params,
+                        output,
+                        global_scale_batch,
+                        scale_params_batch,
+                    )
                     right_batched = mirror_left_prediction_to_right(
                         self.model,
-                        torch.cat(
-                            [
-                                params["wrist_orient"][idx].float(),
-                                params["hand_pose"][idx].float(),
-                            ],
-                            dim=1,
-                        ),
-                        output["pred_cam_t"][idx].float(),
-                        params["identity_coeffs"][idx].float(),
-                        global_scale_batch[idx].float(),
-                        torch.from_numpy(
-                            np.stack(
-                                [batch_hand_data[i]["output_K"] for i in right_indices]
-                            )
-                        )
-                        .float()
-                        .to(self.device),
-                        torch.from_numpy(
-                            np.stack(
-                                [
-                                    batch_hand_data[i]["output_bbx_xys"]
-                                    for i in right_indices
-                                ]
-                            )
-                        )
-                        .float()
-                        .to(self.device),
-                        scale_params=scale_params_batch[idx].float()
-                        if scale_params_batch is not None
-                        else None,
+                        *mirror_args[:6],
+                        scale_params=mirror_args[6],
                         pose_mirror=self._pose_mirror,
                     )
 
-            # One D2H copy per tensor for the whole batch, then index per sample.
-            reliability_cpu = {
-                key: output[key].float().cpu().numpy()
-                for key in KEYPOINT_RELIABILITY_FIELDS
-                if output.get(key) is not None
-            }
-            verts_cpu = output["pred_vertices"].cpu().numpy()
-            transl_cpu = output["pred_cam_t"].cpu().numpy()
-            kp3d_cpu = output["pred_keypoints_3d"].cpu().numpy()
-            kp2d_cpu = output["pred_keypoints_2d"].cpu().numpy()
-            kp2d_valid_cpu = (
-                output.get(
-                    "pred_projection_valid",
-                    torch.isfinite(output["pred_keypoints_2d"]).all(dim=-1),
+            predictions.extend(
+                self._collect_batch_predictions(
+                    batch_hand_data,
+                    output,
+                    params,
+                    global_scale_batch,
+                    scale_params_batch,
+                    right_batched,
+                    right_indices,
                 )
-                .cpu()
-                .numpy()
             )
-            wrist_cpu = params["wrist_orient"].float().cpu().numpy()
-            fingers_cpu = params["hand_pose"].float().cpu().numpy()
-            id_cpu = params["identity_coeffs"].float().cpu().numpy()
-            gs_cpu = global_scale_batch.float().cpu().numpy()
-            sp_cpu = (
-                scale_params_batch.float().cpu().numpy()
-                if scale_params_batch is not None
-                else None
-            )
-            rv_cpu = rt_cpu = rk3_cpu = rk2_cpu = rkv_cpu = rp_cpu = None
-            if right_batched is not None:
-                rv_cpu = right_batched["pred_vertices"].cpu().numpy()
-                rt_cpu = right_batched["transl"].cpu().numpy()
-                rk3_cpu = right_batched["pred_keypoints_3d"].cpu().numpy()
-                rk2_cpu = right_batched["pred_keypoints_2d"].cpu().numpy()
-                rkv_cpu = right_batched["pred_projection_valid"].cpu().numpy()
-                rp_cpu = right_batched["poses"].cpu().numpy()
-            right_pos: dict[int, int] = {i: r for r, i in enumerate(right_indices)}
-
-            for i, d in enumerate(batch_hand_data):
-                side = d["real_hand_side"]
-                if side == "right":
-                    r = right_pos[i]
-                    predictions.append(
-                        {
-                            "pred_vertices": rv_cpu[r],
-                            "transl": rt_cpu[r],
-                            "pred_keypoints_3d": rk3_cpu[r],
-                            "pred_keypoints_2d": rk2_cpu[r],
-                            "pred_projection_valid": rkv_cpu[r],
-                            "poses": rp_cpu[r],
-                            "identity_coeffs": id_cpu[i],
-                            "scale_params": sp_cpu[i] if sp_cpu is not None else None,
-                            "global_scale": float(gs_cpu[i]),
-                            "hand_type": side,
-                            "image_id": d["image_id"],
-                            "K_fullimg": d["output_K"],
-                        }
-                    )
-                else:
-                    predictions.append(
-                        {
-                            "pred_vertices": verts_cpu[i],
-                            "transl": transl_cpu[i],
-                            "pred_keypoints_3d": kp3d_cpu[i],
-                            "pred_keypoints_2d": kp2d_cpu[i],
-                            "pred_projection_valid": kp2d_valid_cpu[i],
-                            "poses": np.concatenate(
-                                [wrist_cpu[i], fingers_cpu[i]], axis=0
-                            ),
-                            "identity_coeffs": id_cpu[i],
-                            "scale_params": sp_cpu[i] if sp_cpu is not None else None,
-                            "global_scale": float(gs_cpu[i]),
-                            "hand_type": side,
-                            "image_id": d["image_id"],
-                            "K_fullimg": d["output_K"],
-                        }
-                    )
-                # Both hands retain anatomical joint order; these describe the model crop.
-                predictions[-1].update(
-                    {key: values[i] for key, values in reliability_cpu.items()}
-                )
             post_forward_ms_total += (time.perf_counter() - post_forward_start) * 1000
             if staged is not None:
                 # Every read of this batch's images is queued; reuse the slot.
@@ -1161,6 +1001,297 @@ class EgoHandPredictor:
             )
             perf_reporter.record_latency(
                 PerfStage.POST_FORWARD, post_forward_ms_total / frame_count
+            )
+        return predictions
+
+    def _run_imagebased_predictions_soma(
+        self, prepared_inputs: list, frame_count: int | None
+    ) -> list:
+        """``_run_imagebased_predictions`` with ``soma_batch_size``.
+
+        Backbone and heads still run per ``batch_size`` batch. The SOMA hand
+        layer, the camera solve, the right-hand mirror and the result copies
+        go through ``SomaBatcher``. Perf stages: model_forward also holds the
+        SOMA layer and camera solve; post_forward holds the rest.
+        """
+        perf_reporter = getattr(self, "perf_reporter", None)
+        timed = perf_reporter is not None and self.device != "cpu"
+        batcher = SomaBatcher(self, self.soma_batch_size, sync_timing=timed)
+        batch_assembly_ms_total = 0.0
+        forward_ms_total = 0.0
+        post_forward_ms_total = 0.0
+        for batch_hand_data, staged in self._batch_source(prepared_inputs):
+            batch_assembly_start = time.perf_counter()
+            batch = self._assemble_batch(batch_hand_data, staged)
+            if timed:
+                torch.cuda.synchronize(self.device)
+            forward_start = time.perf_counter()
+            batch_assembly_ms_total += (forward_start - batch_assembly_start) * 1000
+            with torch.autocast(
+                "cuda", dtype=self.dtype, enabled=(self.dtype != torch.float32)
+            ):
+                head = self.model.forward_step_head(batch, train=False)
+            if timed:
+                torch.cuda.synchronize(self.device)
+            post_forward_start = time.perf_counter()
+            forward_ms_total += (post_forward_start - forward_start) * 1000
+            batch.pop("img")
+            if staged is not None:
+                # The head's reads of this batch's images are queued; reuse the slot.
+                staged.release()
+            batcher.add(batch, batch_hand_data, head)
+            post_forward_ms_total += (time.perf_counter() - post_forward_start) * 1000
+        finish_start = time.perf_counter()
+        predictions = batcher.finish()
+        post_forward_ms_total += (time.perf_counter() - finish_start) * 1000
+        # Batcher time spent in the SOMA layer + camera solve belongs to the forward.
+        forward_ms_total += batcher.left_ms
+        post_forward_ms_total -= batcher.left_ms
+        log.warning(
+            "[EgoHand] SOMA batching %d rows: %d left calls, %d mirror calls, "
+            "left %.0f ms, mirror+copy %.0f ms",
+            batcher.group_rows,
+            batcher.left_calls,
+            batcher.mirror_calls,
+            batcher.left_ms,
+            batcher.right_ms,
+        )
+        if perf_reporter is not None and frame_count:
+            perf_reporter.record_latency(
+                PerfStage.BATCH_ASSEMBLY, batch_assembly_ms_total / frame_count
+            )
+            perf_reporter.record_latency(
+                PerfStage.MODEL_FORWARD, forward_ms_total / frame_count
+            )
+            perf_reporter.record_latency(
+                PerfStage.POST_FORWARD, post_forward_ms_total / frame_count
+            )
+        return predictions
+
+    def _batch_source(self, prepared_inputs):
+        """``(batch_hand_data, staged)`` per forward batch, in input order.
+
+        ``staged`` is the ``StagedCropBatch`` when ``prepared_inputs`` is a
+        ``StreamedCropBatches`` (images already uploaded), else ``None`` and
+        the batch is a ``batch_size`` slice of the prepared list.
+        """
+        if isinstance(prepared_inputs, StreamedCropBatches):
+            # Batches of valid crops, already uploaded while earlier batches ran.
+            return ((staged.hand_data, staged) for staged in prepared_inputs)
+        return (
+            (prepared_inputs[start : start + self.batch_size], None)
+            for start in range(0, len(prepared_inputs), self.batch_size)
+        )
+
+    def _assemble_batch(self, batch_hand_data: list, staged=None) -> dict:
+        """Stack one batch of prepared crops and cameras onto the device."""
+        return {
+            "img": staged.images(self.device)
+            if staged is not None
+            else torch.stack([d["crop_tensor"] for d in batch_hand_data]).to(
+                self.device
+            ),
+            "bbx_xys": torch.from_numpy(
+                np.stack([d["model_bbx_xys"] for d in batch_hand_data])
+            )
+            .float()
+            .to(self.device),
+            "K_fullimg": torch.from_numpy(
+                np.stack([d["model_K"] for d in batch_hand_data])
+            )
+            .float()
+            .to(self.device),
+            "img_size": torch.from_numpy(
+                np.stack([d["model_img_size"] for d in batch_hand_data])
+            )
+            .float()
+            .to(self.device),
+            # Right-hand crops were flipped into the left-hand canonical frame
+            # during preprocessing; the model always sees left-hand inputs.
+            "hand_type": ["left"] * len(batch_hand_data),
+        }
+
+    @staticmethod
+    def _split_batch_params(output: dict):
+        params = output["pred_hand_params"]
+        # EgoHand packs global_scale into scale_params[:, 0] and per-finger
+        # scale into the tail. Split here so the mirror call and D2H loop
+        # below see consistent shapes.
+        scale_params_raw = params["scale_params"]
+        global_scale_batch = scale_params_raw[:, 0]
+        scale_params_batch = (
+            scale_params_raw[:, 1:] if scale_params_raw.shape[1] > 1 else None
+        )
+        return params, global_scale_batch, scale_params_batch
+
+    def _finalize_projection(self, output: dict, batch: dict) -> None:
+        """Weak-perspective translation and final 2D projection validity, in place."""
+        if getattr(self.model, "camera_mode", "weak_perspective") == "weak_perspective":
+            output["pred_cam_t"] = compute_transl_full_cam(
+                output["pred_cam"].float(),
+                batch["bbx_xys"].float(),
+                batch["K_fullimg"].float(),
+            )
+            (
+                output["pred_keypoints_2d"],
+                output["pred_projection_valid"],
+            ) = project_camera_points_to_crop_with_validity(
+                output["pred_keypoints_3d"].float() + output["pred_cam_t"].unsqueeze(1),
+                batch["K_fullimg"].float(),
+                batch["bbx_xys"].float(),
+                min_depth=float(getattr(self.model, "kp2d_min_depth", 1e-4)),
+            )
+
+        pred_camera_points = output["pred_keypoints_3d"].float() + output[
+            "pred_cam_t"
+        ].float().unsqueeze(1)
+        fallback_projection_valid = torch.isfinite(pred_camera_points).all(dim=-1) & (
+            pred_camera_points[..., 2]
+            > float(
+                getattr(
+                    self.model,
+                    "kp2d_min_depth",
+                    1e-4,
+                )
+            )
+        )
+        projection_valid = output.get(
+            "pred_projection_valid",
+            fallback_projection_valid,
+        )
+        projection_valid = projection_valid & torch.isfinite(
+            output["pred_keypoints_2d"]
+        ).all(dim=-1)
+        output["pred_projection_valid"] = projection_valid
+        output["pred_keypoints_2d"] = output["pred_keypoints_2d"].masked_fill(
+            ~projection_valid.unsqueeze(-1),
+            float("nan"),
+        )
+
+    def _right_mirror_inputs(
+        self,
+        batch_hand_data: list,
+        right_indices: list,
+        params: dict,
+        output: dict,
+        global_scale_batch: torch.Tensor,
+        scale_params_batch: torch.Tensor | None,
+    ) -> tuple:
+        """Positional ``mirror_left_prediction_to_right`` inputs plus scale_params."""
+        idx = torch.tensor(right_indices, device=self.device, dtype=torch.long)
+        return (
+            torch.cat(
+                [
+                    params["wrist_orient"][idx].float(),
+                    params["hand_pose"][idx].float(),
+                ],
+                dim=1,
+            ),
+            output["pred_cam_t"][idx].float(),
+            params["identity_coeffs"][idx].float(),
+            global_scale_batch[idx].float(),
+            torch.from_numpy(
+                np.stack([batch_hand_data[i]["output_K"] for i in right_indices])
+            )
+            .float()
+            .to(self.device),
+            torch.from_numpy(
+                np.stack([batch_hand_data[i]["output_bbx_xys"] for i in right_indices])
+            )
+            .float()
+            .to(self.device),
+            scale_params_batch[idx].float() if scale_params_batch is not None else None,
+        )
+
+    @staticmethod
+    def _collect_batch_predictions(
+        batch_hand_data: list,
+        output: dict,
+        params: dict,
+        global_scale_batch: torch.Tensor,
+        scale_params_batch: torch.Tensor | None,
+        right_batched: dict | None,
+        right_indices: list,
+    ) -> list:
+        """Copy one batch's outputs to the host and build its per-crop result dicts."""
+        predictions = []
+        # One D2H copy per tensor for the whole batch, then index per sample.
+        reliability_cpu = {
+            key: output[key].float().cpu().numpy()
+            for key in KEYPOINT_RELIABILITY_FIELDS
+            if output.get(key) is not None
+        }
+        verts_cpu = output["pred_vertices"].cpu().numpy()
+        transl_cpu = output["pred_cam_t"].cpu().numpy()
+        kp3d_cpu = output["pred_keypoints_3d"].cpu().numpy()
+        kp2d_cpu = output["pred_keypoints_2d"].cpu().numpy()
+        kp2d_valid_cpu = (
+            output.get(
+                "pred_projection_valid",
+                torch.isfinite(output["pred_keypoints_2d"]).all(dim=-1),
+            )
+            .cpu()
+            .numpy()
+        )
+        wrist_cpu = params["wrist_orient"].float().cpu().numpy()
+        fingers_cpu = params["hand_pose"].float().cpu().numpy()
+        id_cpu = params["identity_coeffs"].float().cpu().numpy()
+        gs_cpu = global_scale_batch.float().cpu().numpy()
+        sp_cpu = (
+            scale_params_batch.float().cpu().numpy()
+            if scale_params_batch is not None
+            else None
+        )
+        rv_cpu = rt_cpu = rk3_cpu = rk2_cpu = rkv_cpu = rp_cpu = None
+        if right_batched is not None:
+            rv_cpu = right_batched["pred_vertices"].cpu().numpy()
+            rt_cpu = right_batched["transl"].cpu().numpy()
+            rk3_cpu = right_batched["pred_keypoints_3d"].cpu().numpy()
+            rk2_cpu = right_batched["pred_keypoints_2d"].cpu().numpy()
+            rkv_cpu = right_batched["pred_projection_valid"].cpu().numpy()
+            rp_cpu = right_batched["poses"].cpu().numpy()
+        right_pos: dict[int, int] = {i: r for r, i in enumerate(right_indices)}
+
+        for i, d in enumerate(batch_hand_data):
+            side = d["real_hand_side"]
+            if side == "right":
+                r = right_pos[i]
+                predictions.append(
+                    {
+                        "pred_vertices": rv_cpu[r],
+                        "transl": rt_cpu[r],
+                        "pred_keypoints_3d": rk3_cpu[r],
+                        "pred_keypoints_2d": rk2_cpu[r],
+                        "pred_projection_valid": rkv_cpu[r],
+                        "poses": rp_cpu[r],
+                        "identity_coeffs": id_cpu[i],
+                        "scale_params": sp_cpu[i] if sp_cpu is not None else None,
+                        "global_scale": float(gs_cpu[i]),
+                        "hand_type": side,
+                        "image_id": d["image_id"],
+                        "K_fullimg": d["output_K"],
+                    }
+                )
+            else:
+                predictions.append(
+                    {
+                        "pred_vertices": verts_cpu[i],
+                        "transl": transl_cpu[i],
+                        "pred_keypoints_3d": kp3d_cpu[i],
+                        "pred_keypoints_2d": kp2d_cpu[i],
+                        "pred_projection_valid": kp2d_valid_cpu[i],
+                        "poses": np.concatenate([wrist_cpu[i], fingers_cpu[i]], axis=0),
+                        "identity_coeffs": id_cpu[i],
+                        "scale_params": sp_cpu[i] if sp_cpu is not None else None,
+                        "global_scale": float(gs_cpu[i]),
+                        "hand_type": side,
+                        "image_id": d["image_id"],
+                        "K_fullimg": d["output_K"],
+                    }
+                )
+            # Both hands retain anatomical joint order; these describe the model crop.
+            predictions[-1].update(
+                {key: values[i] for key, values in reliability_cpu.items()}
             )
         return predictions
 

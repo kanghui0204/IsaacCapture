@@ -986,6 +986,24 @@ class EgoHand(nn.Module):
     def forward_step(
         self, batch: Dict, train: bool = False, un_rotate: bool = False
     ) -> Dict:
+        head = self.forward_step_head(batch, train=train, un_rotate=un_rotate)
+        with torch.amp.autocast("cuda", enabled=False):
+            hand_out = self.soma_hand(
+                hand_type="left", pose2rot=False, **head["soma_inputs"]
+            )
+        return self.forward_step_decode(head, hand_out["joints"], hand_out["vertices"])
+
+    def forward_step_head(
+        self, batch: Dict, train: bool = False, un_rotate: bool = False
+    ) -> Dict:
+        """``forward_step`` up to (not including) the left SOMA hand layer.
+
+        Returns the state ``forward_step_decode`` needs. ``forward_step`` is
+        exactly head -> ``soma_hand(hand_type="left", pose2rot=False,
+        **head["soma_inputs"])`` -> decode; splitting it lets a caller run the
+        SOMA layer for several head batches in one call (the SOMA layer is
+        row-independent) and then decode each batch as before.
+        """
         x = batch["img"]
         batch_size = x.shape[0]
         device = x.device
@@ -1154,20 +1172,55 @@ class EgoHand(nn.Module):
             pred_global_scale, pred_scale_params = self._split_scale_params(
                 pred_hand_params["scale_params"].float()
             )
-            hand_out = self.soma_hand(
-                poses=poses_25,
-                identity_coeffs=pred_hand_params["identity_coeffs"].float(),
-                hand_type="left",
-                pose2rot=False,
-                global_scale=pred_global_scale,
-                scale_params=pred_scale_params,
-            )
-            pred_joints = hand_out["joints"]
-            pred_vertices = hand_out["vertices"]
+            soma_inputs = {
+                "poses": poses_25,
+                "identity_coeffs": pred_hand_params["identity_coeffs"].float(),
+                "global_scale": pred_global_scale,
+                "scale_params": pred_scale_params,
+            }
+        return {
+            "output": output,
+            "soma_inputs": soma_inputs,
+            "pred_cam": pred_cam,
+            "direct_kp2d_output": direct_kp2d_output,
+            "batch_size": batch_size,
+            "device": device,
+            "train": train,
+            "un_rotate": un_rotate,
+            "aug_rot": batch.get("aug_rot", None),
+            "is_full_perspective": is_full_perspective,
+            "img_wh": img_wh,
+            "box_center": box_center,
+            "box_size": box_size,
+            "focal": focal,
+            "K_fullimg": K_fullimg,
+        }
+
+    def forward_step_decode(
+        self,
+        head: Dict,
+        pred_joints: torch.Tensor,
+        pred_vertices: torch.Tensor,
+    ) -> Dict:
+        """Finish ``forward_step`` from the left SOMA joints and vertices of ``head``."""
+        output = head["output"]
+        pred_cam = head["pred_cam"]
+        direct_kp2d_output = head["direct_kp2d_output"]
+        batch_size = head["batch_size"]
+        device = head["device"]
+        train = head["train"]
+        un_rotate = head["un_rotate"]
+        is_full_perspective = head["is_full_perspective"]
+        img_wh = head["img_wh"]
+        box_center = head["box_center"]
+        box_size = head["box_size"]
+        focal = head["focal"]
+        K_fullimg = head["K_fullimg"]
+        with torch.amp.autocast("cuda", enabled=False):
             pred_camera_parameter_f = pred_cam.float()
 
             if un_rotate:
-                aug_rot = batch.get("aug_rot", None)
+                aug_rot = head["aug_rot"]
                 if aug_rot is not None:
                     aug_rot_f = torch.as_tensor(
                         aug_rot, device=device, dtype=torch.float32

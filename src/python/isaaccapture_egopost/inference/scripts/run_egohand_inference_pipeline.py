@@ -708,6 +708,7 @@ def main():
         dtype=dtype,
         smooth=args.postprocessing_smooth,
         use_perspective_cropping=use_perspective_cropping,
+        soma_batch_size=args.soma_batch_size,
     )
     if args.background_model_load:
         print(
@@ -784,6 +785,7 @@ def main():
                         else "unknown"
                     ),
                     "batch_size": args.batch_size,
+                    "soma_batch_size": args.soma_batch_size,
                     "dtype": args.dtype,
                     "dino_compile": args.dino_compile,
                     "perspective_cropping": use_perspective_cropping,
