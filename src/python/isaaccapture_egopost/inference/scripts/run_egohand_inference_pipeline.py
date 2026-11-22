@@ -233,12 +233,13 @@ def check_frame_batching(bbox_detector, frame_batch_size) -> None:
     ):
         return
     reject_input(
-        "--frame_batch_size cannot be used with bbox_smoothing, which needs "
-        "whole-clip detection before EgoHand cropping. Omit --frame_batch_size, "
+        "--frame_batch_size cannot be used with bbox_smoothing or track_cleanup, "
+        "which need whole-clip detection before EgoHand cropping. Omit "
+        "--frame_batch_size, "
         "or generate boxes with run_hand_detector.py and use saved_bboxes.yaml "
-        "for batched EgoHand inference. Setting bbox_smoothing: false permits "
-        "batching, but live RT-DETR tracking then runs independently within "
-        "each batch."
+        "for batched EgoHand inference. Setting bbox_smoothing: false (with no "
+        "track_cleanup switch on) permits batching, but live RT-DETR tracking "
+        "then runs independently within each batch."
     )
 
 

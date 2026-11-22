@@ -20,7 +20,9 @@ config YAML. The reconstruction pass that reads these boxes instead uses
 ``saved_bboxes.yaml``, as shown below.
 Only ``detector_backend: rtdetr`` is accepted here -- ``saved_bboxes`` is the
 other backend this fork supports, and it reads bbox JSONs rather than
-producing them, so it has no role in a standalone detection run.
+producing them, so it has no role in a standalone detection run. An optional
+``track_cleanup:`` mapping in the same YAML applies the same track cleanup as
+live detection (see ``configs/rtdetr_track_cleanup.yaml``).
 
 Usage (source-frame bboxes followed by perspective cropping):
     python inference/hand_detector_2d/scripts/run_hand_detector.py \\
@@ -92,6 +94,11 @@ from .detector import (  # noqa: E402
     boxes_from_tracks,
     hf_download,
 )
+from .track_cleanup import (  # noqa: E402
+    RTDetrTrackCleanupDetector,
+    TrackCleanupConfig,
+    build_detector,
+)
 from inference.media.video_io import (  # noqa: E402
     find_videos,
     get_video_meta,
@@ -113,6 +120,23 @@ DEFAULT_FRAME_BATCH = 256
 # importing the full inference package. SavedBBoxDetector derives ``stem`` from the
 # containing folder's name -- see write_bbox_jsons.
 BBOX_FILE_PATTERN = "{stem}_{hand}_bbox.json"
+
+
+def _read_detector_yaml(path: str) -> dict:
+    """Read a detector YAML, expanding ``${ENV_VAR}``; exit with a message on error."""
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise SystemExit(
+            "Reading a bbox detector config needs PyYAML (requirements.txt pins "
+            "pyyaml==6.0.3). Install it with `pip install pyyaml`."
+        ) from exc
+
+    try:
+        raw = Path(path).read_text()
+    except OSError as exc:
+        raise SystemExit(f"--bbox_detector_config {path}: {exc.strerror}") from exc
+    return yaml.safe_load(os.path.expandvars(raw)) or {}
 
 
 def load_rtdetr_config(path: str) -> tuple[RTDetrConfig, bool]:
@@ -137,19 +161,7 @@ def load_rtdetr_config(path: str) -> tuple[RTDetrConfig, bool]:
             out-of-range value under ``rtdetr_config``. All of these are
             user-typed configuration, so they get a message, not a traceback.
     """
-    try:
-        import yaml
-    except ImportError as exc:  # pragma: no cover - depends on the environment
-        raise SystemExit(
-            "Reading a bbox detector config needs PyYAML (requirements.txt pins "
-            "pyyaml==6.0.3). Install it with `pip install pyyaml`."
-        ) from exc
-
-    try:
-        raw = Path(path).read_text()
-    except OSError as exc:
-        raise SystemExit(f"--bbox_detector_config {path}: {exc.strerror}") from exc
-    cfg = yaml.safe_load(os.path.expandvars(raw)) or {}
+    cfg = _read_detector_yaml(path)
 
     backend = cfg.get("detector_backend")
     if backend != SUPPORTED_BACKEND:
@@ -179,6 +191,21 @@ def load_rtdetr_config(path: str) -> tuple[RTDetrConfig, bool]:
         )
         config = dataclasses.replace(config, weights=weights)
     return config, bool(cfg.get("tracking", False))
+
+
+def load_track_cleanup_config(path: str) -> TrackCleanupConfig | None:
+    """Read the optional ``track_cleanup:`` mapping of the YAML (``None`` when absent).
+
+    Raises:
+        SystemExit: an unknown key or invalid value under ``track_cleanup``.
+    """
+    data = _read_detector_yaml(path).get("track_cleanup")
+    if data is None:
+        return None
+    try:
+        return TrackCleanupConfig.from_dict(data)
+    except ValueError as exc:
+        raise SystemExit(f"{path}: {exc}") from exc
 
 
 def detect_video(detector, video_path, batch_size, max_frames, resize_params=None):
@@ -217,6 +244,18 @@ def detect_video(detector, video_path, batch_size, max_frames, resize_params=Non
 def boxes_for_video(detector, image_ids, detections, hands, size, *, fps):
     """Convert detections to boxes using the detector's tracking settings."""
     width, _ = size
+    if isinstance(detector, RTDetrTrackCleanupDetector):
+        bbox_per_hand, info = detector.track_boxes(
+            image_ids,
+            detections,
+            hands,
+            size,
+            frame_times=[int(image_id) / fps for image_id in image_ids],
+        )
+        detector.log_tracking(info, hands)
+        detector.log_cleanup(info)
+        return bbox_per_hand
+
     if detector.use_tracker:
         bbox_per_hand, info = boxes_from_tracks(
             image_ids,
@@ -360,8 +399,17 @@ def main():
         raise SystemExit(f"No MP4 files found at {args.input}")
 
     config, tracking = load_rtdetr_config(args.bbox_detector_config)
+    cleanup = load_track_cleanup_config(args.bbox_detector_config)
     # Use the same detector construction as the full EgoHand pipeline.
-    detector = config.build(device=args.device, tracking=tracking)
+    if cleanup is None:
+        detector = config.build(device=args.device, tracking=tracking)
+    else:
+        try:
+            detector = build_detector(
+                config, cleanup, device=args.device, tracking=tracking
+            )
+        except ValueError as exc:
+            raise SystemExit(f"{args.bbox_detector_config}: {exc}") from exc
 
     output_dir = Path(args.output_dir)
     log.info(

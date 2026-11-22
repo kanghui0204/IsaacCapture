@@ -112,11 +112,45 @@ reconstruct using `saved_bboxes.yaml`.
 See the [config reference](scripts/README.md#bbox-detector-config-yaml-schema)
 for thresholds, tracking, padding, and ONNX batch size.
 
+## Clean up the RT-DETR hand tracks (optional)
+
+The bundled tracker gives each hand a box on almost every frame: it holds the
+first and last box to the clip ends, fills every gap whatever its length,
+accepts any candidate above 0.15, and trusts the detector's left/right class.
+On footage where hands leave the frame this yields boxes for hands that are
+not there, or both boxes on one hand. An optional `track_cleanup:` mapping in
+the RT-DETR config adds rules that run after detection; the ONNX model and its
+preprocessing do not change.
+
+Every switch is off by default. Without a `track_cleanup:` mapping, or with
+every switch false, the detector is exactly the one `rtdetr.yaml` builds.
+[`rtdetr_track_cleanup.yaml`](configs/rtdetr_track_cleanup.yaml) turns all of
+them on:
+
+| Key | What it does |
+| --- | --- |
+| `sides_by_position` | Left/right from the image position instead of the RT-DETR class: class-agnostic NMS, the two best boxes above 0.5, the one with the smaller x is the left hand; a lone box takes the side of the image half it is on. |
+| `drop_off_screen` | No box for a hand that is not in the image: no holding to the clip ends; a gap is filled only if it lasts at most 0.83 s (25 frames at 30 fps), its two ends are close and the hand did not leave through a border. |
+| `score_hysteresis` | A hand starts only above 0.5; 0.15 to 0.5 only continues a hand next to its previous box. Short segments without a confident box and boxes larger than half the image are dropped. |
+| `constant_velocity` | Constant-velocity Kalman gate per hand, no 90 px/frame centre clamp, and forward-backward (RTS) smoothing of the centre, so the crop does not lag a fast hand. The crop size keeps the `bbox_smoothing` rules. |
+| `gap_bridge` | Fills a longer gap (up to 2 s) when low-score detections (0.05 and up) lie on the path between its two ends on most gap frames. Requires `drop_off_screen`; lowers the ONNX score threshold to 0.05. |
+| `containment_nms` | A box lying inside a bigger box (a hand inside a hand-plus-forearm box) is the same hand. Requires `sides_by_position`. |
+| `sides_per_tracklet` | Links the chosen boxes into short tracklets and gives each tracklet one side by a vote over its whole life, so a hand near the image centre does not flip sides. Requires `sides_by_position`. |
+
+Thresholds and time constants are further keys of the same mapping, listed in
+[`rtdetr/track_cleanup/config.py`](rtdetr/track_cleanup/config.py). The cleanup
+needs `tracking: true` and `drop_gap_filled: false`, and works on whole clips
+like `bbox_smoothing`: live reconstruction rejects `--frame_batch_size`. For
+long videos, run the same YAML through `run_hand_detector.py` (below) and
+reconstruct from the saved boxes. The rules run on the CPU after detection.
+
 ## Known limitation: hands entering or leaving the frame
 
 The bundled detector and tracker assume both hands are visible in frame.
 When a hand disappears and re-enters partway through, the tracker can misassign or duplicate boxes.
 This is not currently flagged in the results or in `--postprocessing_qc`.
+The optional [track cleanup](#clean-up-the-rt-detr-hand-tracks-optional)
+removes most of these boxes; it is off by default.
 If your footage includes hands entering/leaving the frame and this matters
 for your use case, inspect the bbox overlay video, or supply your own
 boxes/ground truth via the

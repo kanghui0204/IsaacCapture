@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-OpenMDW-1.1
+
+# rtdetr.yaml plus the optional track cleanup. Every switch is off by default;
+# without a track_cleanup mapping (or with every switch false) the detector is
+# exactly the one rtdetr.yaml builds. See ../README.md#clean-up-the-rt-detr-hand-tracks.
+detector_backend: rtdetr
+rtdetr_config:
+  # Offline post-filter; set false to retain the previous native boxes.
+  bbox_smoothing: true
+  bbox_size_scale: 0.8
+  bbox_size_alpha_grow: 0.12
+  bbox_size_alpha_shrink: 0.06
+  bbox_max_size_change: 0.01
+tracking: true
+track_cleanup:
+  sides_by_position: true   # left/right from image position, not the RT-DETR class
+  drop_off_screen: true     # no box for a hand that has left the image
+  score_hysteresis: true    # start > 0.5, continue >= 0.15; drop short weak segments
+  constant_velocity: true   # Kalman gate + forward-backward smoothing, no 90 px/frame clamp
+  gap_bridge: true          # fill longer gaps only along low-score detector evidence
+  containment_nms: true     # a hand box inside a hand-plus-forearm box is one hand
+  sides_per_tracklet: true  # one side per tracklet, voted over its whole life

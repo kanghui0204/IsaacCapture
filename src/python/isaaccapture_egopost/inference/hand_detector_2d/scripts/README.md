@@ -229,6 +229,42 @@ this script, then run batched EgoHand with `saved_bboxes.yaml` as shown above.
 This script's decode batching and the ONNX `batch_size` remain supported: both
 accumulate detections before the filter runs once on the complete track.
 
+### Track cleanup (optional)
+
+A top-level `track_cleanup:` mapping next to `rtdetr_config:` adds rules after
+detection ([overview](../README.md#clean-up-the-rt-detr-hand-tracks-optional),
+example [`rtdetr_track_cleanup.yaml`](../configs/rtdetr_track_cleanup.yaml)).
+This script and the pipeline read the same mapping. Every key is optional;
+switches default to `false`, and with no switch on the detector is unchanged.
+Switches need `tracking: true` and `drop_gap_filled: false`. Times are in
+seconds; sizes and distances are in box sides unless stated otherwise.
+
+| Key | Default | Description |
+| --- | ------- | ----------- |
+| `sides_by_position` | `false` | Left/right from image position (class-agnostic NMS at `nms_iou`; two boxes above `start_score` by x order, a lone box by image half). The sides then never cross, so `lr_order` has no further effect |
+| `drop_off_screen` | `false` | No holding to the clip ends; fill a gap only if short (`max_gap_s`), its ends are close (`gap_max_dist`) and the hand did not cross a border (`edge_margin`, `exit_speed`); end a track whose predicted box is mostly outside the image; drop boxes with less than `min_visible` of their area inside |
+| `score_hysteresis` | `false` | Start a hand above `start_score`; continue it from `continue_score` when the box overlaps its previous one (`gate_iou`, within `max_age_s`); remove segments shorter than `min_seg_s` whose best score is below `seg_keep_score`; drop boxes larger than `max_area_frac` of the image |
+| `constant_velocity` | `false` | Kalman gate on the predicted box (`gate_chi2`, `gate_size`, `gate_max`; noise `q_acc`, `r_pos`, `q_ls`, `r_ls`), continuation from `redetect_score` inside the gate, no centre clamp, RTS centre smoothing |
+| `gap_bridge` | `false` | Fill a gap of up to `bridge_max_s` when boxes with score `>= bridge_min_score` that are not on the other hand (IoU `< bridge_other_iou`) match the interpolated box (IoU `>= bridge_iou`) on `>= bridge_share` of its frames. Requires `drop_off_screen` |
+| `containment_nms` | `false` | Drop a box whose overlap with a higher-scored box covers `>= containment_frac` of the smaller one. Requires `sides_by_position` |
+| `sides_per_tracklet` | `false` | One side per tracklet (link: `tracklet_gap_s`, `tracklet_dist`, `tracklet_size`, `tracklet_ambiguity`; vote: `tracklet_band`, `tracklet_sep_lo`, `tracklet_sep_hi`; frames with evidence below `tracklet_weak_only` follow the tracklet). Requires `sides_by_position` |
+| `start_score` / `continue_score` / `redetect_score` | `0.5` / `0.15` / `0.15` | Score thresholds used above |
+| `nms_iou` / `gate_iou` / `max_age_s` | `0.5` / `0.35` / `0.2` | |
+| `min_seg_s` / `seg_keep_score` / `max_area_frac` | `0.1` / `0.8` / `0.5` | |
+| `max_gap_s` / `gap_max_dist` / `edge_margin` / `exit_speed` / `min_visible` | `0.833` / `1.0` / `0.01` / `0.02` / `0.1` | `edge_margin` is a fraction of the image size; `exit_speed` is in box sides per frame at 30 fps |
+| `q_acc` / `r_pos` / `gate_chi2` / `gate_size` / `gate_max` / `q_ls` / `r_ls` | `0.08` / `0.06` / `9.21` / `0.7` / `1.0` / `0.03` / `0.08` | Per frame at 30 fps, rescaled for other frame rates |
+| `bridge_max_s` / `bridge_iou` / `bridge_share` / `bridge_min_score` / `bridge_other_iou` | `2.0` / `0.5` / `0.6` / `0.05` / `0.2` | |
+| `containment_frac` | `0.7` | |
+| `tracklet_gap_s` / `tracklet_dist` / `tracklet_size` / `tracklet_ambiguity` / `tracklet_band` / `tracklet_sep_lo` / `tracklet_sep_hi` / `tracklet_weak_only` | `0.2` / `0.6` / `0.7` / `0.1` / `0.1` / `0.25` / `0.75` / `1.0` | `tracklet_band` is a fraction of the image width |
+
+Unknown keys, non-boolean switches, negative or non-finite numbers, scores,
+IoUs and fractions above 1, a zero `nms_iou`, `max_area_frac`, `r_pos`, `r_ls`,
+`gate_*` or `tracklet_band|dist|size`, `continue_score` above `start_score`,
+`tracklet_sep_lo` not below `tracklet_sep_hi`, and a switch whose required switch
+is off are rejected like invalid `rtdetr_config` values. `track_cleanup: false`
+is the same as no mapping. Thresholds below 0.15 lower the ONNX score threshold
+accordingly. The defaults were tuned and evaluated on 30 fps clips only.
+
 ### `detector_backend: saved_bboxes`
 
 ```yaml

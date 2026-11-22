@@ -3,7 +3,9 @@
 
 """Build an RT-DETRv2 hand bbox detector for ``detector_backend: rtdetr``.
 
-Paired with ``rtdetr.yaml`` / ``rtdetr_docker.yaml`` in this directory.
+Paired with ``rtdetr.yaml`` / ``rtdetr_docker.yaml`` in this directory. An optional
+``track_cleanup:`` mapping (see ``rtdetr_track_cleanup.yaml``) turns on cleanup rules
+for the whole-clip tracks; without it the detector is unchanged.
 """
 
 import dataclasses
@@ -37,6 +39,11 @@ def _rtdetr_config(data: dict | None):
 
 
 def build(cfg: dict, device: str, batch_size: int, tracking: bool):
-    return _rtdetr_config(cfg.get("rtdetr_config")).build(
-        device=device, tracking=tracking
+    config = _rtdetr_config(cfg.get("rtdetr_config"))
+    if cfg.get("track_cleanup") is None:
+        return config.build(device=device, tracking=tracking)
+    from inference.hand_detector_2d.rtdetr.track_cleanup import build_detector
+
+    return build_detector(
+        config, cfg["track_cleanup"], device=device, tracking=tracking
     )

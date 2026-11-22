@@ -509,6 +509,12 @@ class RTDetrHandBBoxDetector:
             gaps = hand_info["frames"] - hand_info["detected"]
             if hand_info["never_detected"]:
                 reason = "hand never detected in this clip, so no track was emitted"
+            elif info.get("cleanup"):
+                reason = (
+                    f"{hand_info['gap_filled']} gap-filled, "
+                    f"{hand_info['frames'] - hand_info['emitted']} frame(s) left "
+                    "without a box by track_cleanup"
+                )
             elif hand_info["gap_filled"]:
                 reason = f"{hand_info['gap_filled']} gap-filled"
             elif gaps:
@@ -714,6 +720,16 @@ class RTDetrConfig:
         if self.bbox_smoothing and not tracking:
             raise ValueError("bbox_smoothing requires tracking=true")
         return RTDetrHandBBoxDetector(
+            **self.detector_kwargs(device=device, tracking=tracking)
+        )
+
+    def detector_kwargs(self, *, device: str, tracking: bool = False) -> dict:
+        """The ``RTDetrHandBBoxDetector`` arguments ``build`` passes (no validation).
+
+        Detectors built on top of it (the track cleanup) take the same arguments,
+        so a setting added here reaches them too.
+        """
+        return dict(
             weights=self.weights,
             device=device,
             batch_size=self.batch_size,
