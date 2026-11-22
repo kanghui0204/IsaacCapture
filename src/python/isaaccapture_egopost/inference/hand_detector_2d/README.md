@@ -137,12 +137,56 @@ them on:
 | `containment_nms` | A box lying inside a bigger box (a hand inside a hand-plus-forearm box) is the same hand. Requires `sides_by_position`. |
 | `sides_per_tracklet` | Links the chosen boxes into short tracklets and gives each tracklet one side by a vote over its whole life, so a hand near the image centre does not flip sides. Requires `sides_by_position`. |
 
-Thresholds and time constants are further keys of the same mapping, listed in
+Three more switches check new hands with a hand-landmark model; see
+[the next section](#check-new-hands-with-mediapipe-optional). Thresholds and
+time constants are further keys of the same mapping, listed in
 [`rtdetr/track_cleanup/config.py`](rtdetr/track_cleanup/config.py). The cleanup
 needs `tracking: true` and `drop_gap_filled: false`, and works on whole clips
 like `bbox_smoothing`: live reconstruction rejects `--frame_batch_size`. For
 long videos, run the same YAML through `run_hand_detector.py` (below) and
 reconstruct from the saved boxes. The rules run on the CPU after detection.
+
+## Check new hands with MediaPipe (optional)
+
+An object that RT-DETR scores above 0.5 as a hand still starts a "hand" under
+the rules above. `mediapipe_check: true` asks the MediaPipe
+hand-landmark model whether such a box contains a hand: a box that starts a
+hand, or continues one with a score of 0.5 or less, is dropped when the model's
+hand presence is below 0.1. Two companion switches skip the check where it
+rejects real hands: `mediapipe_skip_reacquired` for a box where a hand was
+tracked for at least 0.5 s until less than 1 s ago, and `mediapipe_skip_fast`
+for low-score continuations of a fast, motion-blurred hand. With `gap_bridge`,
+a gap is bridged only if one supporting box looks like a hand (presence 0.05 or
+more). [`rtdetr_track_cleanup_mediapipe.yaml`](configs/rtdetr_track_cleanup_mediapipe.yaml)
+is `rtdetr_track_cleanup.yaml` plus these three switches.
+
+The model runs only on the crops whose decision depends on it, one at a time,
+on the detector's ONNX Runtime providers. It needs no new Python package
+(`onnxruntime-gpu` and `opencv-python` are already in the requirements; the
+`mediapipe` package is not used), but the model file is not bundled:
+
+```bash
+curl -L -o handpose_estimation_mediapipe_2023feb.onnx \
+  https://huggingface.co/opencv/handpose_estimation_mediapipe/resolve/main/handpose_estimation_mediapipe_2023feb.onnx
+echo "db0898ae717b76b075d9bf563af315b29562e11f8df5027a1ef07b02bef6d81c  handpose_estimation_mediapipe_2023feb.onnx" \
+  | sha256sum -c
+export MEDIAPIPE_HAND_WEIGHTS="$(pwd)/handpose_estimation_mediapipe_2023feb.onnx"
+```
+
+The detector checks this sha256 when it loads the model, because the
+thresholds were tuned on this file.
+
+**License.** `handpose_estimation_mediapipe_2023feb.onnx` is Google's
+MediaPipe hand-landmark model converted to ONNX by the
+[OpenCV Zoo](https://huggingface.co/opencv/handpose_estimation_mediapipe),
+both under the Apache License 2.0. If you redistribute the file, for example in
+a container image, include the Apache-2.0 license text and keep its
+attribution.
+
+The check needs the decoded frames while tracking, so it works in live
+detection only: `run_hand_detector.py` keeps just the detections of each
+decoded batch and rejects `mediapipe_check`. MediaPipe's handedness output is
+not used.
 
 ## Known limitation: hands entering or leaving the frame
 

@@ -10,8 +10,8 @@ default, and a config with no switch on builds the stock detector
 Times are in seconds and converted with the clip frame rate; motion constants are
 per frame at 30 fps (``REF_FPS``) and rescaled for other rates; the defaults were
 tuned and evaluated on 30 fps clips only. Scores are RT-DETR scores (0..1).
-Processing order: per-frame choice -> sides per tracklet -> short segments -> gap
-bridge -> gap filling -> smoothing.
+Processing order: per-frame choice (with the MediaPipe check) -> sides per
+tracklet -> short segments -> gap bridge -> gap filling -> smoothing.
 
 sides_by_position
     Left/right from image position instead of the RT-DETR class: class-agnostic
@@ -38,6 +38,13 @@ constant_velocity
     clamp, and a forward-backward (RTS) smoother replaces the causal EMA centre
     smoothing, so the crop does not lag a fast hand. The crop size keeps the
     production rules (0.8 scale, coverage guard, EMA in log size, rate limit).
+mediapipe_check
+    A box that starts a hand (and, with ``mediapipe_check_continuations``, a
+    continuation scored at most ``start_score``) is kept only if the MediaPipe
+    hand-landmark model gives it a hand presence >= ``mediapipe_min_presence``
+    (``mediapipe_check.py``; needs ``mediapipe_weights``). With ``gap_bridge`` a
+    gap is bridged only if one supporting box has presence >=
+    ``bridge_min_presence``.
 gap_bridge
     Fill a gap that ``drop_off_screen`` does not fill (up to ``bridge_max_s``)
     when detector boxes with score >= ``bridge_min_score`` (not on the other
@@ -46,6 +53,17 @@ gap_bridge
     the gap frames. The supporting boxes become detections; the other gap frames
     are interpolated. Requires ``drop_off_screen``. Lowers the ONNX score
     threshold to ``bridge_min_score``; the per-frame choice still uses 0.15 and up.
+mediapipe_skip_reacquired
+    A box above ``start_score`` outside both hands' gates that lies within
+    ``reacquire_dist`` box sides of the last box of a hand seen at most
+    ``reacquire_s`` ago, after a run of at least ``reacquire_min_run_s``, starts
+    the hand without the MediaPipe check. Requires ``mediapipe_check`` and
+    ``sides_by_position``.
+mediapipe_skip_fast
+    While a hand's Kalman speed is >= ``fast_speed`` box sides per frame (30 fps),
+    its low-score continuations in the gate skip the MediaPipe check (motion blur)
+    and may go down to ``fast_score``. Requires ``mediapipe_check``,
+    ``constant_velocity`` and ``sides_by_position``.
 containment_nms
     A candidate whose intersection with a higher-scored kept box covers >=
     ``containment_frac`` of the smaller box is dropped (a hand box inside a
@@ -73,7 +91,10 @@ RULES = (
     "drop_off_screen",
     "score_hysteresis",
     "constant_velocity",
+    "mediapipe_check",
     "gap_bridge",
+    "mediapipe_skip_reacquired",
+    "mediapipe_skip_fast",
     "containment_nms",
     "sides_per_tracklet",
 )
@@ -111,6 +132,12 @@ POSITIVE = (
 # Switch -> switches it needs (a switch without them would silently do nothing).
 REQUIRES = {
     "gap_bridge": ("drop_off_screen",),
+    "mediapipe_skip_reacquired": ("mediapipe_check", "sides_by_position"),
+    "mediapipe_skip_fast": (
+        "mediapipe_check",
+        "constant_velocity",
+        "sides_by_position",
+    ),
     "containment_nms": ("sides_by_position",),
     "sides_per_tracklet": ("sides_by_position",),
 }
@@ -122,9 +149,14 @@ class TrackCleanupConfig:
     drop_off_screen: bool = False
     score_hysteresis: bool = False
     constant_velocity: bool = False
+    mediapipe_check: bool = False
     gap_bridge: bool = False
+    mediapipe_skip_reacquired: bool = False
+    mediapipe_skip_fast: bool = False
     containment_nms: bool = False
     sides_per_tracklet: bool = False
+    # handpose_estimation_mediapipe_2023feb.onnx (mediapipe_check.py)
+    mediapipe_weights: str | None = None
     # thresholds
     start_score: float = 0.5
     continue_score: float = 0.15
@@ -150,12 +182,23 @@ class TrackCleanupConfig:
     gate_max: float = 1.0
     q_ls: float = 0.03
     r_ls: float = 0.08
+    # mediapipe_check
+    mediapipe_min_presence: float = 0.1
+    mediapipe_check_continuations: bool = True
     # gap_bridge
     bridge_max_s: float = 2.0
     bridge_iou: float = 0.5
     bridge_share: float = 0.6
     bridge_min_score: float = 0.05
     bridge_other_iou: float = 0.2
+    bridge_min_presence: float = 0.05
+    # mediapipe_skip_reacquired
+    reacquire_s: float = 1.0
+    reacquire_dist: float = 1.0
+    reacquire_min_run_s: float = 0.5
+    # mediapipe_skip_fast
+    fast_speed: float = 0.15
+    fast_score: float = 0.15
     # containment_nms
     containment_frac: float = 0.7
     # sides_per_tracklet. Link a box to a tracklet seen at most tracklet_gap_s ago
@@ -206,6 +249,8 @@ class TrackCleanupConfig:
             lo = min(lo, self.continue_score)
         if self.constant_velocity:
             lo = min(lo, self.redetect_score)
+            if self.mediapipe_skip_fast:
+                lo = min(lo, self.fast_score)
         return lo
 
     @classmethod
@@ -232,7 +277,12 @@ class TrackCleanupConfig:
             )
         for key, value in data.items():
             default = fields[key].default
-            if isinstance(default, bool):
+            if key == "mediapipe_weights":
+                if value is not None and not isinstance(value, str):
+                    raise ValueError(
+                        f"track_cleanup {key} must be a path, got {value!r}"
+                    )
+            elif isinstance(default, bool):
                 if not isinstance(value, bool):
                     raise ValueError(
                         f"track_cleanup {key} must be true or false, got {value!r}"

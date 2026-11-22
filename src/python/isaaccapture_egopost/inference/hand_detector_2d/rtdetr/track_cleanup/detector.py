@@ -15,7 +15,12 @@ from pathlib import Path
 import numpy as np
 
 from ..bbox_smoothing import validate_frame_times
-from ..detector import RTDetrHandBBoxDetector, _is_valid_box, boxes_from_tracks
+from ..detector import (
+    RTDetrHandBBoxDetector,
+    _is_valid_box,
+    _providers_for_device,
+    boxes_from_tracks,
+)
 from ..tracking import THR_RESCUE, HandTracker
 from .config import TrackCleanupConfig
 from .track import track_clip
@@ -32,6 +37,7 @@ def boxes_from_tracks_cleanup(
     *,
     smoothing=None,
     frame_times=None,
+    verify=None,
     enforce_lr_order=True,
 ):
     """``detector.boxes_from_tracks`` with the track cleanup.
@@ -49,6 +55,8 @@ def boxes_from_tracks_cleanup(
             above ``tracking.THR_RESCUE``.
         smoothing: Optional ``BBoxSmoothingConfig``, as for ``boxes_from_tracks``.
         frame_times: Timestamps in seconds aligned with ``image_ids``; required.
+        verify: ``mediapipe_check.LazyVerifier`` (or any ``fn(t, cand) ->
+            (presence, handedness)``); required with ``mediapipe_check``.
         enforce_lr_order: As for ``boxes_from_tracks``.
 
     Returns:
@@ -89,6 +97,7 @@ def boxes_from_tracks_cleanup(
         cleanup,
         smoothing=smoothing,
         frame_times=frame_times,
+        verify=verify,
         enforce_lr=enforce_lr_order,
     )
     out, per_hand = {}, {}
@@ -116,6 +125,7 @@ def boxes_from_tracks_cleanup(
         "crossed": int(st.get("crossed", 0)),
         "cleanup": cleanup.name,
         "cleanup_stats": st,
+        "mediapipe_crops": getattr(verify, "computed", 0),
     }
     return out, info
 
@@ -126,7 +136,8 @@ class RTDetrTrackCleanupDetector(RTDetrHandBBoxDetector):
     Args:
         weights: Path to the RT-DETRv2 ``.onnx`` file.
         cleanup: The switches; at least one must be on (``build_detector``
-            returns the stock detector otherwise).
+            returns the stock detector otherwise). ``mediapipe_check`` loads
+            ``cleanup.mediapipe_weights`` on the detector's ONNX providers.
         device, providers, **detector_kwargs: Passed to
             ``RTDetrHandBBoxDetector`` (``RTDetrConfig.detector_kwargs``), which
             runs with ``use_tracker=True`` and ``drop_gap_filled=False``.
@@ -155,10 +166,25 @@ class RTDetrTrackCleanupDetector(RTDetrHandBBoxDetector):
         # redetect_score).
         if cleanup.min_score() < self.detector.score_thr:
             self.detector.score_thr = cleanup.min_score() - 1e-12
+        self.verifier = None
+        if cleanup.mediapipe_check:
+            if not cleanup.mediapipe_weights:
+                raise ValueError(
+                    "mediapipe_check needs track_cleanup.mediapipe_weights"
+                )
+            from .mediapipe_check import MediaPipeHandVerifier
+
+            self.verifier = MediaPipeHandVerifier(
+                cleanup.mediapipe_weights,
+                providers=providers
+                if providers is not None
+                else _providers_for_device(device),
+            )
         log.info(
-            "[RTDetrTrackCleanup] switches=%s detector score_thr=%.3f",
+            "[RTDetrTrackCleanup] switches=%s detector score_thr=%.3f mediapipe=%s",
             cleanup.name,
             self.detector.score_thr,
+            None if self.verifier is None else self.verifier.providers,
         )
 
     @property
@@ -170,11 +196,22 @@ class RTDetrTrackCleanupDetector(RTDetrHandBBoxDetector):
         mode = f"native-tracker+cleanup[{self.cleanup.name}]"
         return mode + "+bbox-smoothing" if self.smoothing is not None else mode
 
-    def track_boxes(self, image_ids, detections, hands, image_size, *, frame_times):
+    def track_boxes(
+        self, image_ids, detections, hands, image_size, *, frame_times, images_bgr=None
+    ):
         """Boxes of a complete clip from its ``detect_frames`` detections.
 
-        Returns ``(bbox_per_hand, info)`` like ``boxes_from_tracks_cleanup``.
+        ``mediapipe_check`` reads the candidate crops from ``images_bgr`` (aligned
+        with ``image_ids``). Returns ``(bbox_per_hand, info)`` like
+        ``boxes_from_tracks_cleanup``.
         """
+        verify = None
+        if self.verifier is not None:
+            if images_bgr is None:
+                raise ValueError("mediapipe_check needs the clip's frames (images_bgr)")
+            from .mediapipe_check import LazyVerifier
+
+            verify = LazyVerifier(images_bgr=images_bgr, verifier=self.verifier)
         return boxes_from_tracks_cleanup(
             image_ids,
             detections,
@@ -183,6 +220,7 @@ class RTDetrTrackCleanupDetector(RTDetrHandBBoxDetector):
             self.cleanup,
             smoothing=self.smoothing,
             frame_times=frame_times,
+            verify=verify,
             enforce_lr_order=self.enforce_lr_order,
         )
 
@@ -192,7 +230,12 @@ class RTDetrTrackCleanupDetector(RTDetrHandBBoxDetector):
             for k, v in info["cleanup_stats"].items()
             if k not in ("present", "emitted")
         }
-        log.info("[RTDetrTrackCleanup] %s: %s", info["cleanup"], stats)
+        log.info(
+            "[RTDetrTrackCleanup] %s: %s, MediaPipe crops %d",
+            info["cleanup"],
+            stats,
+            info["mediapipe_crops"],
+        )
 
     def run(
         self,
@@ -227,6 +270,7 @@ class RTDetrTrackCleanupDetector(RTDetrHandBBoxDetector):
             hands,
             (width, height),
             frame_times=times,
+            images_bgr=images_bgr,
         )
         self.log_tracking(info, hands)
         self.log_cleanup(info)
@@ -271,6 +315,11 @@ def build_detector(rtdetr_config, cleanup, *, device: str, tracking: bool):
         raise ValueError(
             "track_cleanup decides which gap frames get a box; "
             "set drop_gap_filled: false"
+        )
+    if cleanup.mediapipe_check and not cleanup.mediapipe_weights:
+        raise ValueError(
+            "mediapipe_check needs track_cleanup.mediapipe_weights "
+            "(handpose_estimation_mediapipe_2023feb.onnx)"
         )
     rtdetr_config._validate(rtdetr_config, prefix="rtdetr_config")
     # Every setting the stock detector gets from RTDetrConfig (in tracking mode

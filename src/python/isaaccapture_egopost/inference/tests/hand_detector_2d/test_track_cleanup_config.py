@@ -19,6 +19,7 @@ from inference.hand_detector_2d.rtdetr.detector import RTDetrHandBBoxDetector
 from inference.hand_detector_2d.rtdetr.track_cleanup import (
     RTDetrTrackCleanupDetector,
     TrackCleanupConfig,
+    mediapipe_check,
 )
 
 RULES = {
@@ -105,6 +106,19 @@ def test_empty_config_is_off(data):
         ({"gap_bridge": True}, "gap_bridge requires drop_off_screen"),
         ({"containment_nms": True}, "requires sides_by_position"),
         ({"sides_per_tracklet": True}, "requires sides_by_position"),
+        (
+            {"sides_by_position": True, "mediapipe_skip_reacquired": True},
+            "requires mediapipe_check",
+        ),
+        (
+            {
+                "sides_by_position": True,
+                "mediapipe_check": True,
+                "mediapipe_skip_fast": True,
+            },
+            "requires constant_velocity",
+        ),
+        ({"mediapipe_weights": 3}, "must be a path"),
         ([1, 2], "must be a mapping"),
     ],
 )
@@ -221,6 +235,11 @@ def test_every_rtdetr_setting_reaches_the_cleanup_detector(fake_onnx, monkeypatc
             "drop_gap_filled",
         ),
         (_cfg(track_cleanup={"bogus": 1}), True, "unknown key"),
+        (
+            _cfg(track_cleanup={**RULES, "mediapipe_check": True}),
+            True,
+            "mediapipe_weights",
+        ),
     ],
 )
 def test_invalid_combinations_are_rejected(fake_onnx, cfg, tracking, message):
@@ -295,10 +314,75 @@ def test_run_matches_track_boxes_and_writes_json(fake_onnx, tmp_path):
             assert saved[k] == [float(v) for v in box]
 
 
+class FakeVerifier:
+    """Presence 0.0 for the clutter box (x 600), 0.9 elsewhere; counts the crops."""
+
+    def __init__(self, weights, providers=None):
+        self.providers = ["CPUExecutionProvider"]
+        self.crops = 0
+
+    def presence(self, rgb, cxcywh):
+        self.crops += 1
+        return (0.0 if round(cxcywh[0]) == 600 else 0.9), 0.5
+
+
+def test_run_with_the_mediapipe_check(fake_onnx, monkeypatch, tmp_path):
+    monkeypatch.setattr(mediapipe_check, "MediaPipeHandVerifier", FakeVerifier)
+    n = 40
+    ids = [f"{i:06d}" for i in range(n)]
+    times = {i: int(i) / 30 for i in ids}
+    images = [np.zeros((480, 640, 3), np.uint8) for _ in range(n)]
+
+    def clip_with_confident_clutter():
+        frames = _clip(n)
+        for t in range(25, 35):  # a 0.7 "hand" at (600, 60) for 10 frames
+            frames[t].append(_det(600, 60, 40, 0.7, 2))
+        return frames
+
+    cleanup = {**RULES, "mediapipe_check": True, "mediapipe_weights": "mp.onnx"}
+    det = rtdetr_backend.build(_cfg(track_cleanup=cleanup), "cpu", 4, True)
+    fake_onnx.queue = clip_with_confident_clutter()
+    out = det.run(ids, images, ["left", "right"], frame_times=times)
+    assert not any("right" in out[i] for i in ids[25:35]), "the clutter is not a hand"
+    assert det.verifier.crops > 0
+
+    det = rtdetr_backend.build(_cfg(track_cleanup=RULES), "cpu", 4, True)
+    fake_onnx.queue = clip_with_confident_clutter()
+    out = det.run(ids, images, ["left", "right"], frame_times=times)
+    assert all("right" in out[i] for i in ids[25:35]), "without the check it is"
+
+
 def test_run_needs_frame_times(fake_onnx):
     det = rtdetr_backend.build(_cfg(track_cleanup=RULES), "cpu", 4, True)
     with pytest.raises(ValueError, match="frame_times"):
         det.run(["000000"], [np.zeros((48, 64, 3), np.uint8)], ["left"])
+
+
+def test_standalone_script_rejects_the_mediapipe_check(tmp_path):
+    cfg = tmp_path / "detector.yaml"
+    cfg.write_text(
+        "detector_backend: rtdetr\n"
+        "rtdetr_config: {weights: hand_detector.onnx}\n"
+        "tracking: true\n"
+        "track_cleanup: {sides_by_position: true, mediapipe_check: true}\n"
+    )
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--input",
+            str(cfg),  # any existing file; the config is rejected before decoding
+            "--output_dir",
+            str(tmp_path / "out"),
+            "--bbox_detector_config",
+            str(cfg),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode != 0
+    assert "mediapipe_check needs the decoded frames" in res.stderr
 
 
 def test_standalone_script_imports_in_its_own_package_context():

@@ -47,7 +47,7 @@ def config(*switches, **params):
     return TrackCleanupConfig(**dict.fromkeys(switches, True), **params)
 
 
-def run(recs, *switches, smoothing=SMOOTH, **params):
+def run(recs, *switches, smoothing=SMOOTH, verify=None, **params):
     """track_clip with the given switches on (and parameter overrides)."""
     return track_clip(
         recs,
@@ -57,7 +57,14 @@ def run(recs, *switches, smoothing=SMOOTH, **params):
         config(*switches, **params),
         smoothing=smoothing,
         frame_times=np.arange(len(recs)) / FPS,
+        verify=verify,
     )
+
+
+def mediapipe(table, default=0.5):
+    """A MediaPipe answer ``verify(t, c) -> (presence, handedness)`` from
+    ``{(t, round(cx)): presence}``."""
+    return lambda t, c: (table.get((t, round(c[0])), default), 0.5)
 
 
 def stock(recs, smoothing=SMOOTH):

@@ -234,7 +234,8 @@ accumulate detections before the filter runs once on the complete track.
 A top-level `track_cleanup:` mapping next to `rtdetr_config:` adds rules after
 detection ([overview](../README.md#clean-up-the-rt-detr-hand-tracks-optional),
 example [`rtdetr_track_cleanup.yaml`](../configs/rtdetr_track_cleanup.yaml)).
-This script and the pipeline read the same mapping. Every key is optional;
+This script and the pipeline read the same mapping (this script rejects
+`mediapipe_check`, which needs the frames while tracking). Every key is optional;
 switches default to `false`, and with no switch on the detector is unchanged.
 Switches need `tracking: true` and `drop_gap_filled: false`. Times are in
 seconds; sizes and distances are in box sides unless stated otherwise.
@@ -246,6 +247,9 @@ seconds; sizes and distances are in box sides unless stated otherwise.
 | `score_hysteresis` | `false` | Start a hand above `start_score`; continue it from `continue_score` when the box overlaps its previous one (`gate_iou`, within `max_age_s`); remove segments shorter than `min_seg_s` whose best score is below `seg_keep_score`; drop boxes larger than `max_area_frac` of the image |
 | `constant_velocity` | `false` | Kalman gate on the predicted box (`gate_chi2`, `gate_size`, `gate_max`; noise `q_acc`, `r_pos`, `q_ls`, `r_ls`), continuation from `redetect_score` inside the gate, no centre clamp, RTS centre smoothing |
 | `gap_bridge` | `false` | Fill a gap of up to `bridge_max_s` when boxes with score `>= bridge_min_score` that are not on the other hand (IoU `< bridge_other_iou`) match the interpolated box (IoU `>= bridge_iou`) on `>= bridge_share` of its frames. Requires `drop_off_screen` |
+| `mediapipe_check` | `false` | Keep a box that starts a hand, or (with `mediapipe_check_continuations`) continues one with score `<= start_score`, only if the MediaPipe hand-landmark model gives presence `>= mediapipe_min_presence`; with `gap_bridge`, one supporting box needs presence `>= bridge_min_presence`. Needs `mediapipe_weights`; live detection only, this script rejects it ([model and license](../README.md#check-new-hands-with-mediapipe-optional)) |
+| `mediapipe_skip_reacquired` | `false` | No MediaPipe check for a box above `start_score` within `reacquire_dist` box sides of a hand last seen at most `reacquire_s` ago after a run of at least `reacquire_min_run_s`. Requires `mediapipe_check` and `sides_by_position` |
+| `mediapipe_skip_fast` | `false` | No MediaPipe check for low-score continuations while the hand moves at `>= fast_speed` box sides per frame (30 fps); those continuations may go down to `fast_score`. Requires `mediapipe_check`, `constant_velocity` and `sides_by_position` |
 | `containment_nms` | `false` | Drop a box whose overlap with a higher-scored box covers `>= containment_frac` of the smaller one. Requires `sides_by_position` |
 | `sides_per_tracklet` | `false` | One side per tracklet (link: `tracklet_gap_s`, `tracklet_dist`, `tracklet_size`, `tracklet_ambiguity`; vote: `tracklet_band`, `tracklet_sep_lo`, `tracklet_sep_hi`; frames with evidence below `tracklet_weak_only` follow the tracklet). Requires `sides_by_position` |
 | `start_score` / `continue_score` / `redetect_score` | `0.5` / `0.15` / `0.15` | Score thresholds used above |
@@ -254,6 +258,10 @@ seconds; sizes and distances are in box sides unless stated otherwise.
 | `max_gap_s` / `gap_max_dist` / `edge_margin` / `exit_speed` / `min_visible` | `0.833` / `1.0` / `0.01` / `0.02` / `0.1` | `edge_margin` is a fraction of the image size; `exit_speed` is in box sides per frame at 30 fps |
 | `q_acc` / `r_pos` / `gate_chi2` / `gate_size` / `gate_max` / `q_ls` / `r_ls` | `0.08` / `0.06` / `9.21` / `0.7` / `1.0` / `0.03` / `0.08` | Per frame at 30 fps, rescaled for other frame rates |
 | `bridge_max_s` / `bridge_iou` / `bridge_share` / `bridge_min_score` / `bridge_other_iou` | `2.0` / `0.5` / `0.6` / `0.05` / `0.2` | |
+| `mediapipe_weights` | unset | Path to `handpose_estimation_mediapipe_2023feb.onnx` (sha256 `db0898ae…d81c`, checked at load) |
+| `mediapipe_min_presence` / `mediapipe_check_continuations` / `bridge_min_presence` | `0.1` / `true` / `0.05` | |
+| `reacquire_s` / `reacquire_dist` / `reacquire_min_run_s` | `1.0` / `1.0` / `0.5` | |
+| `fast_speed` / `fast_score` | `0.15` / `0.15` | |
 | `containment_frac` | `0.7` | |
 | `tracklet_gap_s` / `tracklet_dist` / `tracklet_size` / `tracklet_ambiguity` / `tracklet_band` / `tracklet_sep_lo` / `tracklet_sep_hi` / `tracklet_weak_only` | `0.2` / `0.6` / `0.7` / `0.1` / `0.1` / `0.25` / `0.75` / `1.0` | `tracklet_band` is a fraction of the image width |
 

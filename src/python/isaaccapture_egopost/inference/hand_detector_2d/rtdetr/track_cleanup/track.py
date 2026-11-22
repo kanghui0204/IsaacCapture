@@ -135,17 +135,30 @@ def _rts_final(native, observed, fps, cfg, smoothing):
     return out
 
 
-def track_clip(recs, W, H, fps, cfg, smoothing=None, frame_times=None, enforce_lr=True):
+def track_clip(
+    recs,
+    W,
+    H,
+    fps,
+    cfg,
+    smoothing=None,
+    frame_times=None,
+    verify=None,
+    enforce_lr=True,
+):
     """recs: per frame {'L': [...], 'R': [...]} of [cx, cy, w, h, score, label_id]
-    candidates (any threshold <= cfg.min_score(); filtered here). Returns dict with
-    'native', 'final', 'present', 'emit', 'cand', 'score', 'src' (each {hand: array})
-    and 'stats'."""
+    candidates (any threshold <= cfg.min_score(); filtered here). ``verify(t, cand)
+    -> (presence, handedness)`` answers the MediaPipe check (``mediapipe_check``).
+    Returns dict with 'native', 'final', 'present', 'emit', 'cand', 'score', 'src'
+    (each {hand: array}) and 'stats'."""
     if not cfg.any_rule:
         raise ValueError(
             "track_clip needs at least one track_cleanup switch; "
             "use boxes_from_tracks otherwise"
         )
     cfg.validate()
+    if cfg.mediapipe_check and verify is None:
+        raise ValueError("mediapipe_check needs a verify callable")
     N = len(recs)
     min_size = T.MIN_SIZE_FRAC * W
     if frame_times is None:
@@ -157,12 +170,12 @@ def track_clip(recs, W, H, fps, cfg, smoothing=None, frame_times=None, enforce_l
     stats = {}
     filled_mask = {}
     if cfg.sides_by_position:
-        sel, st = select_position(recs_f, cfg, W, H, fps)
+        sel, st = select_position(recs_f, cfg, W, H, fps, verify)
         stats.update(st, engine="position")
         if cfg.sides_per_tracklet:
             sel, stats["sides_per_tracklet"] = relabel(sel, cfg, W, fps)
     else:
-        sel, st = select_continuity(recs_f, cfg, W, H, fps)
+        sel, st = select_continuity(recs_f, cfg, W, H, fps, verify)
         stats.update(st, engine="continuity")
     if cfg.score_hysteresis:
         stats["segments_removed"] = _segment_filter(sel, cfg, fps)
@@ -175,7 +188,7 @@ def track_clip(recs, W, H, fps, cfg, smoothing=None, frame_times=None, enforce_l
             )
             for rec in recs
         ]
-        force, st = bridge_gaps(sel, rows, W, H, fps, cfg)
+        force, st = bridge_gaps(sel, rows, W, H, fps, cfg, verify)
         stats.update(st)
 
     raw = {s: np.asarray(sel[s]["box"], np.float64).reshape(N, 4) for s in ("L", "R")}

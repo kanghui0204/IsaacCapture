@@ -79,14 +79,16 @@ def _v2_accepts(sq, present, raw, a, b, W, H, fps, cfg):
     return True
 
 
-def bridge_gaps(sel, rows, W, H, fps, cfg):
+def bridge_gaps(sel, rows, W, H, fps, cfg, verify=None):
     """``gap_bridge``: fill gaps ``drop_off_screen`` would not fill when detector rows
     lie on the straight path between the two ends.
 
     sel: {'L'|'R': {'present', 'box', 'score', 'src'}} lists, modified in place (the
     supporting rows become selected detections, src 3). rows: per frame [cx, cy, w, h,
-    score, ...] candidates of both classes (score-sorted). Returns ({'L'|'R': bool (N,)
-    frames inside a bridged gap}, stats)."""
+    score, ...] candidates of both classes (score-sorted). With a MediaPipe ``verify``
+    (``mediapipe_check``) one supporting row must have presence >=
+    ``bridge_min_presence``. Returns ({'L'|'R': bool (N,) frames inside a bridged
+    gap}, stats)."""
     N = len(rows)
     max_g = max(1, round(cfg.bridge_max_s * fps))
     force = {}
@@ -122,6 +124,16 @@ def bridge_gaps(sel, rows, W, H, fps, cfg):
                     sup.append((t, bc))
             if len(sup) < cfg.bridge_share * g:
                 continue
+            if cfg.bridge_min_presence > 0 and verify is not None:
+                ok = False
+                for t, c in sup:
+                    presence, _ = verify(t, c)
+                    # NaN (not computed) passes, as in the per-frame check
+                    if presence != presence or presence >= cfg.bridge_min_presence:
+                        ok = True
+                        break
+                if not ok:
+                    continue
             stats["bridged_gaps"] += 1
             fm[a + 1 : b] = True
             for t, c in sup:

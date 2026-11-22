@@ -15,14 +15,17 @@ Two engines:
   the hand's previous box), generalised -- with every switch off and every candidate
   above 0.15 it reproduces ``tracking.select_new`` exactly (unit-tested);
 * position (``sides_by_position`` on): the image-position rule plus the
-  ``score_hysteresis`` / ``constant_velocity`` continuation rules and
-  ``containment_nms``.
+  ``score_hysteresis`` / ``constant_velocity`` continuation rules,
+  ``containment_nms`` and the MediaPipe skip rules.
+
+Both engines apply ``mediapipe_check`` through ``verify(t, cand) -> (presence,
+handedness)`` (``mediapipe_check.LazyVerifier``).
 """
 
 import math
 
 from .. import tracking as T
-from .motion import CVKalman, LastBox, iou_cxcywh, visible_fraction
+from .motion import CVKalman, LastBox, iou_cxcywh, side_of, visible_fraction
 
 SIDES = ("L", "R")
 
@@ -102,6 +105,10 @@ class _Hands:
             if (cfg.score_hysteresis or cfg.constant_velocity)
             else None
         )
+        # mediapipe_skip_reacquired: real detections of the current run per hand (a
+        # run restarts after a gap of more than max_age_s)
+        self.run = dict.fromkeys(SIDES, 0)
+        self.gap_reset = max(1, round(cfg.max_age_s * fps))
 
     def active(self, s, t):
         p = self.p[s]
@@ -123,10 +130,47 @@ class _Hands:
         return self.p[s].predict(t) if self.active(s, t) else None
 
     def update(self, s, t, c):
-        self.p[s].update(t, c)
+        p = self.p[s]
+        new_run = p.t is None or t - p.t > self.gap_reset
+        self.run[s] = 1 if new_run else self.run[s] + 1
+        p.update(t, c)
+
+    def recent(self, c, t, max_frames, dist, min_run):
+        """``mediapipe_skip_reacquired``: c lies within ``dist`` box sides of the last
+        box of a hand (either side) updated 1..max_frames ago whose run had at least
+        ``min_run`` real detections."""
+        for s in SIDES:
+            p = self.p[s]
+            if p.t is None or not (0 < t - p.t <= max_frames) or self.run[s] < min_run:
+                continue
+            last = [p.x[0, 0], p.x[1, 0], *p.wh] if isinstance(p, CVKalman) else p.box
+            d = math.hypot(c[0] - last[0], c[1] - last[1])
+            if d / max(side_of(c), side_of(last)) <= dist:
+                return True
+        return False
+
+    def fast(self, s):
+        """``mediapipe_skip_fast``: the hand's Kalman speed is >= fast_speed box sides
+        per frame (30 fps)."""
+        p = self.p[s]
+        if not isinstance(p, CVKalman):
+            return False
+        vel = p.velocity()
+        if vel is None:
+            return False
+        speed = math.hypot(*vel) / p.k / side_of([0, 0, *p.wh])
+        return speed >= self.cfg.fast_speed
 
 
-def select_continuity(recs, cfg, W, H, fps):
+def _verified(verify, cfg, t, c):
+    if not cfg.mediapipe_check or verify is None:
+        return True
+    presence, _ = verify(t, c)
+    # NaN (a verify callable that did not compute it) passes: as if unchecked
+    return not (presence == presence) or presence >= cfg.mediapipe_min_presence
+
+
+def select_continuity(recs, cfg, W, H, fps, verify=None):
     pools = _frames_to_pools(recs, cfg, W, H)
     hands = _Hands(cfg, fps, W, H)
     thr_use = cfg.start_score if cfg.score_hysteresis else T.THR
@@ -137,7 +181,7 @@ def select_continuity(recs, cfg, W, H, fps):
     )
     valued = cfg.score_hysteresis
     out = {s: {"present": [], "box": [], "score": [], "src": []} for s in SIDES}
-    stats = {"rescued": 0, "label_ignored": 0, "crossed": 0}
+    stats = {"rescued": 0, "label_ignored": 0, "crossed": 0, "mediapipe_rejected": 0}
     for t, (rec, pool) in enumerate(zip(recs, pools)):
         gate = {}
         usable = []
@@ -150,6 +194,12 @@ def select_continuity(recs, cfg, W, H, fps):
             elif c[4] >= thr_rescue and any_g:
                 pass
             else:
+                continue
+            ask = not any_g or (
+                cfg.mediapipe_check_continuations and c[4] <= cfg.start_score
+            )
+            if cfg.mediapipe_check and ask and not _verified(verify, cfg, t, c):
+                stats["mediapipe_rejected"] += 1
                 continue
             usable.append(c)
         usable.sort(key=lambda c: -c[4])
@@ -224,15 +274,43 @@ def select_continuity(recs, cfg, W, H, fps):
     return out, stats
 
 
-def select_position(recs, cfg, W, H, fps):
+def select_position(recs, cfg, W, H, fps, verify=None):
     pools = _frames_to_pools(recs, cfg, W, H)
     hands = _Hands(cfg, fps, W, H)
     cont = cfg.score_hysteresis or cfg.constant_velocity
     thr_cont = cfg.redetect_score if cfg.constant_velocity else cfg.continue_score
+    reacquire = (
+        max(1, round(cfg.reacquire_s * fps)),
+        cfg.reacquire_dist,
+        max(1, round(cfg.reacquire_min_run_s * fps)),
+    )
     out = {s: {"present": [], "box": [], "score": [], "src": []} for s in SIDES}
-    stats = {"rescued": 0, "side_by_half": 0, "crossed": 0}
+    stats = {
+        "rescued": 0,
+        "side_by_half": 0,
+        "crossed": 0,
+        "mediapipe_rejected": 0,
+        "reacquired": 0,
+        "fast_unchecked": 0,
+    }
     for t, pool in enumerate(pools):
-        high = [c for c in pool if c[4] > cfg.start_score]
+        high = []
+        for c in pool:
+            if c[4] <= cfg.start_score:
+                continue
+            if cfg.mediapipe_check:
+                g_any = hands.gated(c, "L", t)[0] or hands.gated(c, "R", t)[0]
+                if (
+                    not g_any
+                    and cfg.mediapipe_skip_reacquired
+                    and hands.recent(c, t, *reacquire)
+                ):
+                    g_any = True  # a hand tracked here moments ago comes back
+                    stats["reacquired"] += 1
+                if not g_any and not _verified(verify, cfg, t, c):
+                    stats["mediapipe_rejected"] += 1
+                    continue
+            high.append(c)
         pick = high[:2]
         A = {"L": None, "R": None}
         if len(pick) == 2:
@@ -249,8 +327,10 @@ def select_position(recs, cfg, W, H, fps):
                     continue
                 other = A["R" if s == "L" else "L"]
                 best = None
+                fast = cfg.mediapipe_skip_fast and hands.fast(s)
+                thr_c = min(cfg.fast_score, thr_cont) if fast else thr_cont
                 for c in pool:
-                    if c in pick or c[4] < thr_cont:
+                    if c in pick or c[4] < thr_c:
                         continue
                     ok, cost = hands.gated(c, s, t)
                     if not ok:
@@ -262,6 +342,14 @@ def select_position(recs, cfg, W, H, fps):
                         or (s == "R" and c[0] < other[0])
                     ):
                         continue
+                    check = cfg.mediapipe_check and cfg.mediapipe_check_continuations
+                    if check and c[4] <= cfg.start_score:
+                        if fast:
+                            # a fast (blurred) hand is not asked
+                            stats["fast_unchecked"] += 1
+                        elif not _verified(verify, cfg, t, c):
+                            stats["mediapipe_rejected"] += 1
+                            continue
                     key = (c[4], -cost)
                     if best is None or key > best[0]:
                         best = (key, c)

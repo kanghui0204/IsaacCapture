@@ -24,6 +24,7 @@ from inference.tests.hand_detector_2d.synthetic_tracks import (
     W,
     H,
     cand,
+    mediapipe,
     random_recs,
     recs_from,
     run,
@@ -38,6 +39,9 @@ MOTION = "constant_velocity"
 BRIDGE = "gap_bridge"
 CONTAIN = "containment_nms"
 TRACKLET = "sides_per_tracklet"
+MP = "mediapipe_check"
+REACQUIRE = "mediapipe_skip_reacquired"
+FAST = "mediapipe_skip_fast"
 
 
 # --- every switch off: the stock tracker ---
@@ -296,12 +300,124 @@ def test_no_bridge_with_too_few_supported_frames():
     assert new["stats"]["bridged_gaps"] == 0
 
 
+def test_no_bridge_when_mediapipe_never_sees_a_hand():
+    recs = recs_from([(1, {**_HAND, **_WEAK})], 120)
+    no_hand = mediapipe({(t, 402): 0.0 for t in range(40, 80)})
+    assert run(recs, *BASE, MP, BRIDGE, verify=no_hand)["stats"]["bridged_gaps"] == 0
+    one_hand = mediapipe({(50, 402): 0.3})
+    assert run(recs, *BASE, MP, BRIDGE, verify=one_hand)["stats"]["bridged_gaps"] == 1
+
+
 def test_rows_on_the_other_hand_are_not_support():
     # the left hand leaves at 40; the right hand walks along the straight path between
     # the left hand's two ends
     right = {t: cand(400, 700, score=0.9, label=2) for t in range(41, 79)}
     new = run(recs_from([(1, _HAND), (2, right)], 120), *BASE, BRIDGE)
     assert new["stats"].get("bridged_gaps", 0) == 0
+
+
+# --- mediapipe_check, mediapipe_skip_reacquired, mediapipe_skip_fast ---
+
+
+def test_mediapipe_check_drops_clutter_that_starts_a_hand():
+    n = 20
+    hand = {t: cand(400, 700, 200, 0.9, 1) for t in range(n)}
+    clutter = {t: cand(1100, 300, 150, 0.7, 2) for t in range(n)}
+    recs = recs_from([(1, hand), (2, clutter)], n)
+    presence = mediapipe({(t, 1100): 0.01 for t in range(n)}, default=0.9)
+    r = run(recs, POSITION, MP, verify=presence)
+    assert r["present"]["left"].all()
+    assert not r["present"]["right"].any()
+    assert run(recs, POSITION)["present"]["right"].all()
+
+
+def test_low_score_continuation_needs_presence():
+    n = 30
+    d = {t: cand(400, 700, 200, 0.9 if t < 10 else 0.3, 1) for t in range(n)}
+    recs = recs_from([(1, d)], n)
+    yes = mediapipe({}, default=0.8)
+    assert run(recs, POSITION, HYSTERESIS, MP, verify=yes)["present"]["left"].all()
+
+    def hand_until_10(t, c):
+        return (0.8 if t < 10 else 0.02, 0.5)
+
+    r = run(recs, POSITION, HYSTERESIS, MP, verify=hand_until_10)
+    assert r["present"]["left"][:10].all()
+    assert not r["present"]["left"][10:].any()
+    # without mediapipe_check_continuations only boxes that start a hand are checked
+    r = run(
+        recs,
+        POSITION,
+        HYSTERESIS,
+        MP,
+        verify=hand_until_10,
+        mediapipe_check_continuations=False,
+    )
+    assert r["present"]["left"].all()
+
+
+def test_mediapipe_check_needs_a_verifier():
+    with pytest.raises(ValueError, match="verify"):
+        run(random_recs(0, n=10), POSITION, MP)
+
+
+def test_reacquired_hand_skips_mediapipe():
+    # a 30-frame track, 10 missed frames, then the hand comes back 0.5 side away;
+    # MediaPipe says 0.0 on its return
+    d = {t: cand(400 + t, 700, score=0.9) for t in range(30)}
+    d.update({t: cand(530, 700, score=0.9) for t in range(40, 60)})
+    recs = recs_from([(1, d)], 60)
+    no = mediapipe({(t, 530): 0.0 for t in range(40, 60)})
+    assert not run(recs, *BASE, MP, verify=no)["present"]["left"][40:60].any()
+    r = run(recs, *BASE, MP, REACQUIRE, verify=no)
+    assert r["present"]["left"][40:60].all()
+
+
+def test_short_track_does_not_reacquire():
+    # the earlier track lasted 5 frames (< 0.5 s): a box there later is still checked
+    d = {t: cand(400, 700, score=0.9) for t in range(5)}
+    d.update({t: cand(420, 700, score=0.9) for t in range(15, 40)})
+    recs = recs_from([(1, d)], 40)
+    no = mediapipe({(t, 420): 0.0 for t in range(15, 40)})
+    r = run(recs, *BASE, MP, REACQUIRE, verify=no)
+    assert not r["present"]["left"][15:40].any()
+
+
+def test_far_box_is_still_checked():
+    # the box comes back 2 sides away from the last box: not a re-acquisition
+    d = {t: cand(400, 700, score=0.9) for t in range(30)}
+    d.update({t: cand(400, 1100, score=0.9) for t in range(40, 60)})
+    recs = recs_from([(1, d)], 60)
+    no = mediapipe({(t, 400): 0.0 for t in range(40, 60)})
+    r = run(recs, *BASE, MP, REACQUIRE, verify=no)
+    assert not r["present"]["left"][40:60].any()
+
+
+def _blurred(step):
+    """A left-half hand moving down ``step`` px/frame; frames 20..24 only have 0.3
+    boxes that MediaPipe calls 0.0."""
+    d = {
+        t: cand(400, 100 + step * t, s=160, score=0.3 if 20 <= t < 25 else 0.9)
+        for t in range(30)
+    }
+    return recs_from([(1, d)], 30)
+
+
+def _no_hand_on_20_to_24(t, c):
+    return (0.0 if 20 <= t < 25 else 0.5, 0.5)
+
+
+def test_fast_low_score_continuation_skips_mediapipe():
+    recs = _blurred(40)  # 0.25 box sides per frame
+    r = run(recs, *BASE, MP, verify=_no_hand_on_20_to_24)
+    assert not r["present"]["left"][20:25].any()
+    r = run(recs, *BASE, MP, FAST, verify=_no_hand_on_20_to_24)
+    assert r["present"]["left"][20:25].all()
+
+
+def test_slow_hand_is_still_checked():
+    r = run(_blurred(2), *BASE, MP, FAST, verify=_no_hand_on_20_to_24)
+    assert not r["present"]["left"][20:25].any()
 
 
 # --- containment_nms ---
@@ -421,7 +537,14 @@ def test_parameters_of_switches_that_are_off_change_nothing():
         containment_frac=0.1,
         tracklet_band=0.5,
         tracklet_dist=3.0,
+        reacquire_s=5.0,
+        fast_speed=0.0,
+        mediapipe_min_presence=0.9,
     )
+    assert same_outputs(a, b)
+    presence = mediapipe({}, default=0.3)
+    a = run(recs, *BASE, MP, verify=presence)
+    b = run(recs, *BASE, MP, verify=presence, reacquire_s=5.0, fast_speed=0.0)
     assert same_outputs(a, b)
 
 

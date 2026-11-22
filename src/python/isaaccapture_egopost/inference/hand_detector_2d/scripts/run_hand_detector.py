@@ -400,6 +400,13 @@ def main():
 
     config, tracking = load_rtdetr_config(args.bbox_detector_config)
     cleanup = load_track_cleanup_config(args.bbox_detector_config)
+    if cleanup is not None and cleanup.mediapipe_check:
+        raise SystemExit(
+            f"{args.bbox_detector_config}: track_cleanup mediapipe_check needs the "
+            "decoded frames while tracking, but this script keeps only the detections "
+            "of each decoded batch. Use live detection in "
+            "run_egohand_inference_pipeline.py, or set mediapipe_check: false here."
+        )
     # Use the same detector construction as the full EgoHand pipeline.
     if cleanup is None:
         detector = config.build(device=args.device, tracking=tracking)
