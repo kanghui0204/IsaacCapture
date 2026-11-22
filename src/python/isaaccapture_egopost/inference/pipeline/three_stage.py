@@ -15,17 +15,20 @@ stages work on different videos at once:
    this stage, in single-video order.
 
 ``ThreadedThreeStage`` runs stages 1-2 on threads (stage 2 on its own CUDA
-stream) and stage 3 on the caller's thread; ``run_serial`` runs them back to
-back. A Python error fails only its video; a CUDA error aborts the run.
+stream) and stage 3 on the caller's thread; ``run_process_pipeline`` runs them
+as three processes; ``run_serial`` runs them back to back. A Python error
+fails only its video; a CUDA error aborts the run.
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import io
 import json
 import logging
 import os
+import pickle
 import queue
 import threading
 import time
@@ -91,6 +94,7 @@ class PreparedClip:
     intrinsics_per_image: dict = dataclasses.field(default_factory=dict)
     records: list = dataclasses.field(default_factory=list)
     crops: Any = None  # uint8 [N, 256, 256, 3] (list of arrays or one array)
+    crops_path: str | None = None  # proc mode: .npy in shared memory
     num_jobs: int = 0
     num_failed_crops: int = 0
     times: dict = dataclasses.field(default_factory=dict)
@@ -106,6 +110,26 @@ class PreparedClip:
             self.error_class = type(exc).__name__
             self.error_stage = stage
             self.error_traceback = traceback.format_exc()[-4000:]
+
+    def without_pixels(self) -> "PreparedClip":
+        """Shallow copy for queues between processes: no crops, no camera objects.
+
+        Camera models may hold Warp arrays (distorted cameras), so the receiving
+        process rebuilds ``intrinsics_per_image`` with ``resolve_clip_camera``.
+        """
+        return dataclasses.replace(self, crops=None, intrinsics_per_image={})
+
+    def light(self) -> "PreparedClip":
+        """Shallow copy with only identity, times and error (end-of-clip messages)."""
+        return dataclasses.replace(
+            self,
+            crops=None,
+            records=[],
+            image_ids=[],
+            frame_times=None,
+            bboxes_per_image={},
+            intrinsics_per_image={},
+        )
 
 
 @dataclasses.dataclass
@@ -304,12 +328,19 @@ class PrepareStage:
         self.bbox_detector = bbox_detector
         self.config = config
 
-    def run(self, request: ClipRequest) -> PreparedClip:
-        """Prepare one clip; errors are recorded on the returned clip."""
+    def run(
+        self, request: ClipRequest, crops_out: Callable | None = None
+    ) -> PreparedClip:
+        """Prepare one clip; errors are recorded on the returned clip.
+
+        ``crops_out(clip, crops_list)`` may store the crops elsewhere (proc mode
+        shared memory) and set ``clip.crops_path``; by default the list of
+        uint8 crops is kept on the clip.
+        """
         clip = PreparedClip(request=request)
         clip.times["s1_start"] = time.time()
         try:
-            self._run(clip)
+            self._run(clip, crops_out)
         except Exception as exc:  # noqa: BLE001 - per-video isolation
             clip.fail("prepare", exc)
             clip.crops = None
@@ -318,7 +349,7 @@ class PrepareStage:
         clip.times["s1_end"] = time.time()
         return clip
 
-    def _run(self, clip: PreparedClip) -> None:
+    def _run(self, clip: PreparedClip, crops_out) -> None:
         from inference.camera.intrinsics import resolve_K
         from inference.camera.square_pixel import compute_square_pixel_resize_params
         from inference.postprocessing.adaptive_smoothing import validate_frame_times
@@ -451,7 +482,10 @@ class PrepareStage:
                     records.append(record)
         del crop_jobs, frames
         clip.records = records
-        clip.crops = crops
+        if crops_out is not None:
+            crops_out(clip, crops)
+        else:
+            clip.crops = crops
         clip.times["crop_end"] = time.time()
 
 
@@ -1043,7 +1077,48 @@ def run_serial(
         on_record(clip_record(clip))
 
 
-# --------------------------------------------------------------------------- driver setup
+# --------------------------------------------------------------------------- proc mode
+
+
+def tensors_to(obj, device, non_blocking: bool = False):
+    """Copy every tensor in a nested dict / list / tuple to ``device``."""
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device, non_blocking=non_blocking)
+    if isinstance(obj, dict):
+        return {
+            key: tensors_to(value, device, non_blocking) for key, value in obj.items()
+        }
+    if isinstance(obj, list):
+        return [tensors_to(value, device, non_blocking) for value in obj]
+    if isinstance(obj, tuple):
+        return tuple(tensors_to(value, device, non_blocking) for value in obj)
+    return obj
+
+
+def pack_head_batch(head_batch: HeadBatch) -> bytes:
+    """Host bytes of one head batch for another process (dtype and strides kept)."""
+    payload = {
+        "start": head_batch.start,
+        "rows": len(head_batch.hand_data),
+        "batch": tensors_to(head_batch.batch, "cpu"),
+        "head": tensors_to(head_batch.head, "cpu"),
+    }
+    buffer = io.BytesIO()
+    torch.save(payload, buffer)
+    return buffer.getvalue()
+
+
+def unpack_head_batch(data: bytes, records: list, device) -> HeadBatch:
+    """Inverse of ``pack_head_batch``; ``hand_data`` is the records' slice."""
+    payload = torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
+    start, rows = payload["start"], payload["rows"]
+    return HeadBatch(
+        start=start,
+        hand_data=records[start : start + rows],
+        batch=tensors_to(payload["batch"], device),
+        head=tensors_to(payload["head"], device),
+        event=None,
+    )
 
 
 def claim_requests(
@@ -1070,8 +1145,9 @@ def build_detector(detector_cfg: dict, device: str, batch_size: int):
     """The detector of ``detector_cfg`` by backend name, as
     ``run_egohand_inference_pipeline._build_detector_from_config`` builds it.
 
-    For library callers; the driver builds through the CLI function, which
-    also turns config errors into its one-line invalid-input exit.
+    For the proc-mode stage-1 process and library callers; the driver builds
+    through the CLI function in thr / serial mode, which also turns config
+    errors into its one-line invalid-input exit.
     """
     import importlib
 
@@ -1131,6 +1207,25 @@ def load_predictor(settings: dict):
     return predictor, (time.perf_counter() - t) * 1000.0
 
 
+def trim_for_stage(predictor, stage: str) -> None:
+    """Drop the modules a proc-mode stage never calls and return their GPU memory.
+
+    head: the SOMA hand layers (only ``forward_step`` / decode use them).
+    soma: the DINOv3 backbone and the hand head (only ``forward_step_head``).
+    """
+    import gc
+
+    model = predictor.model
+    if stage == "head":
+        model.soma_hand = None
+    elif stage == "soma":
+        model.backbone = None
+        model.hand_head = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def stage_config_from_settings(settings: dict, camera_mode: str) -> StageConfig:
     return StageConfig(
         hands=list(settings["hands"]),
@@ -1143,3 +1238,438 @@ def stage_config_from_settings(settings: dict, camera_mode: str) -> StageConfig:
         rectify_pixel_aspect_ratio=settings.get("rectify_pixel_aspect_ratio", True),
         perf_metadata=settings.get("perf_metadata"),
     )
+
+
+def _factory(settings: dict, kind: str):
+    """Optional ``"module:function"`` replacing ``build_detector`` / ``load_predictor``
+    in the proc-mode processes (``settings["factories"][kind]``; tests use fakes)."""
+    import importlib
+
+    spec = (settings.get("factories") or {}).get(kind)
+    if not spec:
+        return None
+    module, function = spec.split(":")
+    return getattr(importlib.import_module(module), function)
+
+
+def _cuda_mem() -> dict:
+    if not torch.cuda.is_available():
+        return {}
+    return {
+        "allocated_mib": torch.cuda.memory_allocated() / 2**20,
+        "reserved_mib": torch.cuda.memory_reserved() / 2**20,
+        "max_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+    }
+
+
+def _mp_get(q, stop, poll_s=0.2):
+    while True:
+        if stop.is_set():
+            raise _Stopped()
+        try:
+            return pickle.loads(q.get(timeout=poll_s))
+        except queue.Empty:
+            continue
+
+
+def _mp_put(q, item, stop, poll_s=0.2):
+    # Pickled here, not in the queue's feeder thread, so a pickling error
+    # raises in the sender instead of silently dropping the message.
+    data = pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL)
+    while True:
+        if stop.is_set():
+            raise _Stopped()
+        try:
+            q.put(data, timeout=poll_s)
+            return
+        except queue.Full:
+            continue
+
+
+def _mp_acquire(sem, stop, poll_s=0.2):
+    while not sem.acquire(timeout=poll_s):
+        if stop.is_set():
+            raise _Stopped()
+
+
+def _proc_setup(settings: dict, name: str) -> None:
+    import sys
+
+    for path in settings.get("sys_path", []):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    if settings.get("switch_interval"):
+        sys.setswitchinterval(float(settings["switch_interval"]))
+
+
+def _p1_main(settings, requests, camera_mode, q12, taken, ctrl, stop):
+    """proc mode, process P1: decode + detect + crop; crops to shared memory."""
+    _proc_setup(settings, "t3-p1")
+    try:
+        t = time.perf_counter()
+        make = _factory(settings, "detector")
+        bbox_detector = (
+            make(settings)
+            if make is not None
+            else build_detector(
+                settings["detector_cfg"], settings["device"], settings["batch_size"]
+            )
+        )
+        warm = (
+            warm_detector(bbox_detector) if settings.get("warm_detector", True) else []
+        )
+        config = stage_config_from_settings(settings, camera_mode)
+        prepare = PrepareStage(bbox_detector, config)
+        ctrl.put(
+            ("ready", "prepare", os.getpid(), (time.perf_counter() - t) * 1000.0, warm)
+        )
+        shm_dir = settings["shm_dir"]
+
+        def to_shm(clip, crops):
+            path = os.path.join(shm_dir, f"{clip.request.index:05d}_{clip.stem}.u8.npy")
+            if crops:
+                array = np.lib.format.open_memmap(
+                    path, mode="w+", dtype=np.uint8, shape=(len(crops), *crops[0].shape)
+                )
+                for index, crop in enumerate(crops):
+                    array[index] = crop
+                array.flush()
+                del array
+                clip.crops_path = path
+            crops.clear()
+
+        claimed = 0
+        for request in claim_requests(requests, settings.get("claim_dir")):
+            claimed += 1
+            clip = prepare.run(request, crops_out=to_shm)
+            _mp_put(q12, clip.without_pixels(), stop)
+            if settings.get("prepare_ahead", 1) <= 1:
+                _mp_acquire(taken, stop)
+        _mp_put(q12, (_END, claimed), stop)
+        ctrl.put(("done", "prepare", claimed))
+    except _Stopped:
+        pass
+    except BaseException as exc:  # noqa: BLE001
+        ctrl.put(
+            (
+                "fatal",
+                "prepare",
+                f"{type(exc).__name__}: {exc}",
+                traceback.format_exc()[-4000:],
+            )
+        )
+        raise
+
+
+def _p2_main(settings, q12, q23, taken, slots, ctrl, stop):
+    """proc mode, process P2: DINOv3 + heads; head batches to P3 through host memory."""
+    _proc_setup(settings, "t3-p2")
+    try:
+        make = _factory(settings, "predictor")
+        predictor, load_ms = (make or load_predictor)(settings)
+        if settings.get("trim_models", True):
+            trim_for_stage(predictor, "head")
+        camera_mode = getattr(predictor.model, "camera_mode", "weak_perspective")
+        config = stage_config_from_settings(settings, camera_mode)
+        head = HeadStage(predictor, config)
+        ctrl.put(("ready", "head", os.getpid(), load_ms, camera_mode, _cuda_mem()))
+        while True:
+            item = _mp_get(q12, stop)
+            if isinstance(item, tuple) and item and item[0] == _END:
+                _mp_put(q23, ("end_of_queue", item[1], None), stop)
+                break
+            clip = item
+            if settings.get("prepare_ahead", 1) <= 1:
+                taken.release()
+            if clip.error is not None:
+                _mp_put(q23, ("fail", clip, None), stop)
+                continue
+            _mp_acquire(slots, stop)
+            clip.began = True
+            clip.times["s2_start"] = time.time()
+            _mp_put(q23, ("begin", clip, None), stop)
+            crops = None
+            try:
+                if clip.crops_path:
+                    crops = np.load(clip.crops_path, mmap_mode="r")
+                head.run(
+                    clip,
+                    lambda hb, index=clip.request.index: _mp_put(
+                        q23, ("batch", index, pack_head_batch(hb)), stop
+                    ),
+                    crops=crops if crops is not None else [],
+                )
+            except _Stopped:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                clip.fail("head", exc)
+                clip.times["failed_at"] = time.time()
+                _mp_put(q23, ("fail", clip.light(), None), stop)
+                if is_fatal_cuda_error(exc):
+                    raise
+                if isinstance(exc, torch.cuda.OutOfMemoryError):
+                    torch.cuda.empty_cache()
+                continue
+            finally:
+                del crops
+                if clip.crops_path:
+                    with contextlib.suppress(OSError):
+                        os.unlink(clip.crops_path)
+            clip.times["s2_end"] = time.time()
+            _mp_put(q23, ("end", clip.light(), None), stop)
+        ctrl.put(("done", "head", _cuda_mem()))
+    except _Stopped:
+        pass
+    except BaseException as exc:  # noqa: BLE001
+        ctrl.put(
+            (
+                "fatal",
+                "head",
+                f"{type(exc).__name__}: {exc}",
+                traceback.format_exc()[-4000:],
+            )
+        )
+        raise
+
+
+def _p3_main(settings, q23, slots, ctrl, stop):
+    """proc mode, process P3: SOMA decode, mirror, smoothing and export, on the main thread."""
+    _proc_setup(settings, "t3-p3")
+    try:
+        make = _factory(settings, "predictor")
+        predictor, load_ms = (make or load_predictor)(settings)
+        if settings.get("trim_models", True):
+            trim_for_stage(predictor, "soma")
+        camera_mode = getattr(predictor.model, "camera_mode", "weak_perspective")
+        config = stage_config_from_settings(settings, camera_mode)
+        soma = SomaStage(predictor, config, model_load_ms=load_ms)
+        if settings.get("warp_mempool") and soma.cuda:
+            _enable_warp_mempool(soma.device)
+        ctrl.put(("ready", "soma", os.getpid(), load_ms, camera_mode, _cuda_mem()))
+        clips: dict[int, PreparedClip] = {}
+        while True:
+            kind, clip, payload = _mp_get(q23, stop)
+            if kind == "end_of_queue":
+                ctrl.put(("done", "soma", clip, _cuda_mem()))
+                break
+            if kind == "begin":
+                clips[clip.request.index] = clip
+                try:
+                    if not clip.intrinsics_per_image:
+                        camera = resolve_clip_camera(
+                            clip, config.use_perspective_cropping
+                        )
+                        clip.intrinsics_per_image = dict.fromkeys(
+                            clip.image_ids, camera
+                        )
+                    soma.begin(clip)
+                except Exception as exc:  # noqa: BLE001
+                    clip.fail("soma", exc)
+                continue
+            if kind == "batch":
+                current = clips.get(clip)
+                if current is not None and current.error is None:
+                    try:
+                        soma.add(
+                            unpack_head_batch(payload, current.records, soma.device)
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        current.fail("soma", exc)
+                        current.times["failed_at"] = time.time()
+                        soma.discard()
+                        if is_fatal_cuda_error(exc):
+                            raise
+                continue
+            # end / fail: the message carries P2's copy of the clip (times, error)
+            began = clips.pop(clip.request.index, None)
+            if began is not None:
+                began.times.update(clip.times)
+                if clip.error is not None and began.error is None:
+                    began.error, began.error_class = clip.error, clip.error_class
+                    began.error_stage, began.error_traceback = (
+                        clip.error_stage,
+                        clip.error_traceback,
+                    )
+                clip = began
+            if kind == "end" and clip.error is None:
+                try:
+                    soma.finish(clip)
+                except Exception as exc:  # noqa: BLE001
+                    clip.fail("soma", exc)
+                    clip.times["failed_at"] = time.time()
+                    soma.discard()
+                    if is_fatal_cuda_error(exc):
+                        raise
+                    if isinstance(exc, torch.cuda.OutOfMemoryError):
+                        torch.cuda.empty_cache()
+            else:
+                clip.times.setdefault("failed_at", time.time())
+                soma.discard()
+            if clip.began:
+                slots.release()
+            record = clip_record(clip)
+            record["cuda_p3"] = _cuda_mem()
+            ctrl.put(("record", record))
+    except _Stopped:
+        pass
+    except BaseException as exc:  # noqa: BLE001
+        ctrl.put(
+            (
+                "fatal",
+                "soma",
+                f"{type(exc).__name__}: {exc}",
+                traceback.format_exc()[-4000:],
+            )
+        )
+        raise
+
+
+def run_process_pipeline(
+    settings: dict,
+    requests: list[ClipRequest],
+    on_record: Callable[[dict], None],
+    on_event: Callable[[tuple], None] | None = None,
+    *,
+    ready_timeout_s: float = 900.0,
+) -> dict:
+    """proc mode: run the three stages as three processes (P1 prepare, P2 head,
+    P3 SOMA); returns process info."""
+    import multiprocessing as mp
+    import shutil
+
+    ctx = mp.get_context("spawn")
+    shm_dir = settings["shm_dir"]
+    os.makedirs(shm_dir, exist_ok=True)
+    q12 = ctx.Queue(maxsize=1)
+    q23 = ctx.Queue()
+    ctrl = ctx.Queue()
+    taken = ctx.Semaphore(0)
+    slots = ctx.Semaphore(settings.get("soma_videos", 2))
+    stop = ctx.Event()
+    procs = {
+        "soma": ctx.Process(
+            target=_p3_main, args=(settings, q23, slots, ctrl, stop), name="t3-p3"
+        ),
+        "head": ctx.Process(
+            target=_p2_main,
+            args=(settings, q12, q23, taken, slots, ctrl, stop),
+            name="t3-p2",
+        ),
+    }
+    info: dict = {"ready": {}, "done": {}, "fatal": None, "exitcodes": {}}
+    recorded: set = set()
+    claimed_total = None
+
+    def handle(message) -> None:
+        nonlocal claimed_total
+        kind = message[0]
+        if on_event is not None:
+            on_event(message)
+        if kind == "record":
+            recorded.add(message[1]["i"])
+            on_record(message[1])
+        elif kind == "ready":
+            info["ready"][message[1]] = {
+                "pid": message[2],
+                "load_ms": message[3],
+                **(
+                    {"camera_mode": message[4], "cuda": message[5]}
+                    if len(message) > 5
+                    else {"warmup": message[4]}
+                ),
+                "epoch": time.time(),
+            }
+        elif kind == "done":
+            info["done"][message[1]] = {
+                "epoch": time.time(),
+                "detail": list(message[2:]),
+            }
+            if message[1] == "prepare":
+                claimed_total = message[2]
+        elif kind == "fatal":
+            info["fatal"] = {
+                "stage": message[1],
+                "error": message[2],
+                "traceback": message[3],
+            }
+
+    def poll(timeout: float) -> bool:
+        try:
+            handle(ctrl.get(timeout=timeout))
+            return True
+        except queue.Empty:
+            return False
+
+    def dead() -> list:
+        return [n for n, p in procs.items() if p.exitcode not in (None, 0)]
+
+    for proc in procs.values():
+        proc.start()
+    t0 = time.time()
+    try:
+        while not {"head", "soma"} <= set(info["ready"]):
+            poll(0.5)
+            if dead() or info["fatal"] or time.time() - t0 > ready_timeout_s:
+                raise RuntimeError(
+                    f"proc mode start failed: dead={dead()} fatal={info['fatal']}"
+                )
+        camera_mode = info["ready"]["head"]["camera_mode"]
+        procs["prepare"] = ctx.Process(
+            target=_p1_main,
+            args=(settings, requests, camera_mode, q12, taken, ctrl, stop),
+            name="t3-p1",
+        )
+        procs["prepare"].start()
+        while True:
+            poll(0.5)
+            if info["fatal"] or dead():
+                raise RuntimeError(
+                    f"proc mode stage failed: dead={dead()} fatal={info['fatal']}"
+                )
+            if "soma" in info["done"]:
+                break
+    except BaseException as exc:  # noqa: BLE001
+        info["abort"] = f"{type(exc).__name__}: {exc}"
+        stop.set()
+    finally:
+        deadline = time.time() + 60
+        for proc in procs.values():
+            proc.join(timeout=max(0.0, deadline - time.time()))
+        while poll(0.05):
+            pass
+        for name, proc in procs.items():
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=10)
+            info["exitcodes"][name] = proc.exitcode
+        shutil.rmtree(shm_dir, ignore_errors=True)
+    info["claimed"] = claimed_total
+    info["recorded"] = sorted(recorded)
+    if "abort" in info:
+        # Clips this worker claimed (all, without a claim dir) and did not
+        # finish are lost with the failed process.
+        claim_dir = settings.get("claim_dir")
+        for request in requests:
+            if request.index in recorded:
+                continue
+            if claim_dir:
+                claim = os.path.join(claim_dir, f"{request.index:05d}.claim")
+                try:
+                    owner = int(open(claim).read().split()[0])
+                except (OSError, ValueError, IndexError):
+                    continue
+                if owner != info["ready"].get("prepare", {}).get("pid", owner):
+                    continue
+            on_record(
+                {
+                    "i": request.index,
+                    "name": request.name,
+                    "video": request.video,
+                    "out_root": request.out_root,
+                    "status": "aborted",
+                    "error": info["abort"],
+                    "t_start_epoch": None,
+                    "t_end_epoch": time.time(),
+                }
+            )
+    return info

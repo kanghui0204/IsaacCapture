@@ -6,10 +6,10 @@ as a three-stage pipeline (see ``inference/pipeline/three_stage.py``).
 
 Usage:
     python inference/scripts/run_egohand_three_stage.py --queue queue.json \\
-        [--mode thr|serial] [--summary summary.json] [--claim_dir DIR] \\
+        [--mode thr|proc|serial] [--summary summary.json] [--claim_dir DIR] \\
         [--soma_videos 2] [--prepare_ahead 1] \\
         [--crop_workers 8] [--norm_workers 4] [--warp_mempool] \\
-        [--switch_interval S] [--no-warm_detector] \\
+        [--switch_interval S] [--no-warm_detector] [--no-trim_models] \\
         -- <run_egohand_inference_pipeline.py arguments>
 
 The arguments after ``--`` are parsed by ``run_egohand_inference_pipeline.py``
@@ -21,6 +21,7 @@ queue.json: ``{"items": [{"name", "video", "intrinsics", "out_root"}, ...]}``.
 
 --mode thr     one process; stage 1 and 2 on worker threads, stage 3 on the
                main thread (default).
+--mode proc    three processes (spawn); crops through /dev/shm.
 --mode serial  the stages one after the other (no overlap).
 --claim_dir    several workers share one queue: each item is processed by
                the first worker that claims it (exclusive file create).
@@ -36,6 +37,7 @@ queue.json: ``{"items": [{"name", "video", "intrinsics", "out_root"}, ...]}``.
                pipeline runs (py-soma-x disables it, so every Warp temporary
                is freed with cudaFree, which waits for the whole device).
 --no-warm_detector  skip the ORT warm-up over batch sizes 1..B at start.
+--no-trim_models  proc mode: keep the modules a process does not use.
 
 Not supported (rejected): overlay videos (pass --no_save_videos),
 --save_images, --save_npzs, --per_frame_results, --postprocessing_qc,
@@ -73,7 +75,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # Same module-level setup as `python run_egohand_inference_pipeline.py`
-# (torch.load patch, sys.path).
+# (torch.load patch, sys.path); also runs in the spawned proc-mode children,
+# which import this file as their main module.
 _CLI_PATH = _HERE.parent / "run_egohand_inference_pipeline.py"
 _spec = importlib.util.spec_from_file_location("egopost_cli", _CLI_PATH)
 cli = importlib.util.module_from_spec(_spec)
@@ -92,7 +95,7 @@ def parse_driver_args(argv):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--queue", required=True)
     ap.add_argument("--summary", default=None)
-    ap.add_argument("--mode", choices=("thr", "serial"), default="thr")
+    ap.add_argument("--mode", choices=("thr", "proc", "serial"), default="thr")
     ap.add_argument("--claim_dir", default=None)
     ap.add_argument("--soma_videos", type=int, default=2)
     ap.add_argument("--prepare_ahead", type=int, default=1)
@@ -103,6 +106,10 @@ def parse_driver_args(argv):
     ap.add_argument(
         "--warm_detector", action=argparse.BooleanOptionalAction, default=True
     )
+    ap.add_argument(
+        "--trim_models", action=argparse.BooleanOptionalAction, default=True
+    )
+    ap.add_argument("--shm_root", default="/dev/shm")
     if "--" not in argv:
         ap.error("missing -- before the pipeline arguments")
     cut = argv.index("--")
@@ -241,10 +248,15 @@ def main():
         "prepare_ahead": opt.prepare_ahead,
         "soma_videos": opt.soma_videos,
         "warp_mempool": opt.warp_mempool,
+        "trim_models": opt.trim_models,
         "warm_detector": opt.warm_detector,
         "switch_interval": opt.switch_interval,
         "rectify_pixel_aspect_ratio": args.rectify_pixel_aspect_ratio,
         "claim_dir": opt.claim_dir,
+        "shm_dir": os.path.join(
+            opt.shm_root, f"egopost_three_stage_{os.getpid()}_{int(T_START)}"
+        ),
+        "sys_path": [str(PROJECT_ROOT)],
         "perf_metadata": {
             "checkpoint": Path(args.egohand_ckpt).stem,
             "batch_size": args.batch_size,
@@ -282,8 +294,9 @@ def main():
         record["t_end_s"] = (
             (record["t_end_epoch"] - T_START) if record.get("t_end_epoch") else None
         )
-        record["cuda"] = cuda_mem()
-        record["proc"] = proc_mem()
+        if opt.mode != "proc":
+            record["cuda"] = cuda_mem()
+            record["proc"] = proc_mem()
         records.append(record)
         print(
             f"[three_stage] {record['i']} {record['name']} {record['status']} "
@@ -294,67 +307,102 @@ def main():
         )
         flush()
 
-    try:
-        import warp as wp
+    if opt.mode == "proc":
+        # The detector is built in the stage-1 process; check the backend
+        # name here so a typo is still an invalid-input exit.
+        backend = detector_cfg["detector_backend"]
+        if (
+            importlib.util.find_spec(f"inference.hand_detector_2d.configs.{backend}")
+            is None
+        ):
+            cli.reject_input(
+                f"Unknown detector_backend {backend!r} in the detector config; see "
+                "inference/hand_detector_2d/configs/ for the available backends"
+            )
+        summary["ready_at_s"] = None
+        print(
+            "[three_stage] proc mode: starting P3 (SOMA) and P2 (head), then P1 (prepare)",
+            flush=True,
+        )
 
-        wp.init()  # once, on this thread, before any stage thread uses Warp
-    except ImportError:
-        pass
-    t = time.perf_counter()
-    try:
-        bbox_detector, _ = cli._build_detector_from_config(
-            detector_cfg, args.device, args.batch_size
-        )
-    except cli.DetectorConfigError as exc:
-        cli.reject_input(str(exc))
-    cli.check_frame_batching(bbox_detector, args.frame_batch_size)
-    predictor, load_ms = ts.load_predictor(settings)
-    camera_mode = getattr(predictor.model, "camera_mode", "weak_perspective")
-    config = ts.stage_config_from_settings(settings, camera_mode)
-    try:
-        prepare = ts.PrepareStage(bbox_detector, config)
-    except ts.UnsupportedOption as exc:
-        cli.reject_input(f"run_egohand_three_stage.py does not support: {exc}")
-    head = ts.HeadStage(predictor, config, own_stream=(opt.mode == "thr"))
-    soma = ts.SomaStage(predictor, config, model_load_ms=load_ms)
-    warm = ts.warm_detector(bbox_detector) if opt.warm_detector else []
-    summary.update(
-        mhr_presort=predictor.mhr_presort,
-        model_load_ms=load_ms,
-        load_total_s=time.perf_counter() - t,
-        camera_mode=camera_mode,
-        detector_warmup=warm,
-        ready_epoch=time.time(),
-        ready_at_s=time.perf_counter() - T0,
-        cuda_ready=cuda_mem(),
-    )
-    print(
-        f"[three_stage] mode={opt.mode} ready at {summary['ready_at_s']:.2f}s "
-        f"(model load {load_ms / 1000:.2f}s, detector warm-up "
-        f"{sum(w['s'] for w in warm):.2f}s)",
-        flush=True,
-    )
-    flush()
-    claimed = ts.claim_requests(requests, opt.claim_dir)
-    if opt.mode == "serial":
-        ts.run_serial(prepare, head, soma, claimed, on_record)
-        summary["status"] = "done"
+        def on_event(message):
+            if message[0] == "ready":
+                print(
+                    f"[three_stage] ready: {message[1]} pid={message[2]} load {message[3] / 1000:.2f}s",
+                    flush=True,
+                )
+
+        info = ts.run_process_pipeline(settings, requests, on_record, on_event)
+        summary["processes"] = info
+        ready = [
+            v.get("epoch") for v in info.get("ready", {}).values() if v.get("epoch")
+        ]
+        if ready:
+            summary["ready_epoch"] = max(ready)
+            summary["ready_at_s"] = max(ready) - T_START
+        summary["status"] = "aborted" if "abort" in info else "done"
     else:
-        runner = ts.ThreadedThreeStage(
-            prepare,
-            head,
-            soma,
-            prepare_ahead=opt.prepare_ahead,
-            soma_videos=opt.soma_videos,
-            warp_mempool=opt.warp_mempool,
+        try:
+            import warp as wp
+
+            wp.init()  # once, on this thread, before any stage thread uses Warp
+        except ImportError:
+            pass
+        t = time.perf_counter()
+        try:
+            bbox_detector, _ = cli._build_detector_from_config(
+                detector_cfg, args.device, args.batch_size
+            )
+        except cli.DetectorConfigError as exc:
+            cli.reject_input(str(exc))
+        cli.check_frame_batching(bbox_detector, args.frame_batch_size)
+        predictor, load_ms = ts.load_predictor(settings)
+        camera_mode = getattr(predictor.model, "camera_mode", "weak_perspective")
+        config = ts.stage_config_from_settings(settings, camera_mode)
+        try:
+            prepare = ts.PrepareStage(bbox_detector, config)
+        except ts.UnsupportedOption as exc:
+            cli.reject_input(f"run_egohand_three_stage.py does not support: {exc}")
+        head = ts.HeadStage(predictor, config, own_stream=(opt.mode == "thr"))
+        soma = ts.SomaStage(predictor, config, model_load_ms=load_ms)
+        warm = ts.warm_detector(bbox_detector) if opt.warm_detector else []
+        summary.update(
+            mhr_presort=predictor.mhr_presort,
+            model_load_ms=load_ms,
+            load_total_s=time.perf_counter() - t,
+            camera_mode=camera_mode,
+            detector_warmup=warm,
+            ready_epoch=time.time(),
+            ready_at_s=time.perf_counter() - T0,
+            cuda_ready=cuda_mem(),
         )
-        runner.run(claimed, on_record)
-        summary["status"] = "done" if runner.fatal is None else "aborted"
-        if runner.fatal is not None:
-            summary["fatal"] = f"{type(runner.fatal).__name__}: {runner.fatal}"
-            summary["fatal_traceback"] = runner.fatal_traceback
-    summary["cuda_end"] = cuda_mem()
-    summary["proc_end"] = proc_mem()
+        print(
+            f"[three_stage] mode={opt.mode} ready at {summary['ready_at_s']:.2f}s "
+            f"(model load {load_ms / 1000:.2f}s, detector warm-up "
+            f"{sum(w['s'] for w in warm):.2f}s)",
+            flush=True,
+        )
+        flush()
+        claimed = ts.claim_requests(requests, opt.claim_dir)
+        if opt.mode == "serial":
+            ts.run_serial(prepare, head, soma, claimed, on_record)
+            summary["status"] = "done"
+        else:
+            runner = ts.ThreadedThreeStage(
+                prepare,
+                head,
+                soma,
+                prepare_ahead=opt.prepare_ahead,
+                soma_videos=opt.soma_videos,
+                warp_mempool=opt.warp_mempool,
+            )
+            runner.run(claimed, on_record)
+            summary["status"] = "done" if runner.fatal is None else "aborted"
+            if runner.fatal is not None:
+                summary["fatal"] = f"{type(runner.fatal).__name__}: {runner.fatal}"
+                summary["fatal_traceback"] = runner.fatal_traceback
+        summary["cuda_end"] = cuda_mem()
+        summary["proc_end"] = proc_mem()
     summary["done_epoch"] = time.time()
     summary["t_done_s"] = time.perf_counter() - T0
     flush()

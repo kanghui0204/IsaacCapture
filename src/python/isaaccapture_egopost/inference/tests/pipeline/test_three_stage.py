@@ -570,3 +570,132 @@ def test_claims_split_one_queue(tmp_path):
     assert not set(got_a) & set(got_b)
     assert got_a == sorted(got_a) and got_b == sorted(got_b)
     assert [r.index for r in ts.claim_requests(requests, None)] == list(range(9))
+
+
+def test_head_batch_round_trip_keeps_values_dtypes_strides():
+    base = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+    head = {
+        "output": {
+            "a": base.t(),  # non-contiguous
+            "b": base.to(torch.bfloat16),
+            "flag": False,
+            "nested": [base[:, :2], (base[1:, 3],)],
+        },
+        "batch_size": 4,
+        "device": torch.device("cpu"),
+    }
+    batch = {"bbx_xys": base[:, :3].contiguous(), "hand_type": ["left"] * 4}
+    records = [{"image_id": f"{i:06d}"} for i in range(10)]
+    packed = ts.pack_head_batch(ts.HeadBatch(4, records[4:8], batch, head))
+    got = ts.unpack_head_batch(packed, records, "cpu")
+    assert got.start == 4 and got.hand_data == records[4:8]
+    assert got.batch["hand_type"] == ["left"] * 4
+    for key in ("a", "b"):
+        assert got.head["output"][key].dtype == head["output"][key].dtype
+        assert got.head["output"][key].stride() == head["output"][key].stride()
+        assert torch.equal(got.head["output"][key], head["output"][key])
+    assert torch.equal(got.head["output"]["nested"][1][0], base[1:, 3])
+    assert got.head["output"]["flag"] is False and got.head["device"] == torch.device(
+        "cpu"
+    )
+
+
+# ----------------------------------------------------------------- proc mode (spawned processes)
+
+_PROC_CLIPS = [(0, 7, "p_a"), (1, 1, "p_b"), (2, 5, "p_c")]
+
+
+def _patch_mirror_in_process():
+    import inference.pipeline.predictor as predictor_module
+    import inference.pipeline.soma_batching as soma_batching_module
+
+    _fake_mirror.calls = []
+    predictor_module.mirror_left_prediction_to_right = _fake_mirror
+    soma_batching_module.mirror_left_prediction_to_right = _fake_mirror
+
+
+class _ContentDetector(_FakeDetector):
+    """``_FakeDetector`` that finds the clip by the first frame's bytes (frames are
+    copies in another process)."""
+
+    def run(self, image_ids, images_bgr, hands, output_paths_per_hand=None, **_):
+        clip, _name = self.clip_of[images_bgr[0].tobytes()]
+        return {
+            image_id: _boxes(clip, i, frame, hands, self.perspective)
+            for i, (image_id, frame) in enumerate(zip(image_ids, images_bgr))
+        }
+
+
+def proc_fake_detector(settings):
+    """proc-mode factory (P1): the fake detector."""
+    _patch_mirror_in_process()
+    clip_of = {
+        _frames(clip, count)[0].tobytes(): (clip, name)
+        for clip, count, name in settings["test_clips"]
+    }
+    return _ContentDetector(
+        clip_of, settings["hands"], settings["use_perspective_cropping"]
+    )
+
+
+def proc_fake_predictor(settings):
+    """proc-mode factory (P2, P3): the fake predictor."""
+    _patch_mirror_in_process()
+    return (
+        _predictor(settings["use_perspective_cropping"], settings["soma_batch_size"]),
+        0.0,
+    )
+
+
+@pytest.mark.parametrize("perspective", [False, True])
+def test_process_pipeline_equals_predictor_run(tmp_path, perspective):
+    requests, frames_of, camera, *_ = _setup(tmp_path, perspective, _PROC_CLIPS)
+    module = "inference.tests.pipeline.test_three_stage"
+    settings = {
+        "hands": ["left", "right"],
+        "use_perspective_cropping": perspective,
+        "batch_size": 3,
+        "smooth": False,
+        "soma_batch_size": 0,
+        "device": "cpu",
+        "crop_workers": 2,
+        "norm_workers": 2,
+        "prepare_ahead": 1,
+        "soma_videos": 2,
+        "trim_models": True,
+        "warm_detector": False,
+        "shm_dir": str(tmp_path / "shm"),
+        "detector_cfg": None,
+        "factories": {
+            "detector": f"{module}:proc_fake_detector",
+            "predictor": f"{module}:proc_fake_predictor",
+        },
+        "test_clips": _PROC_CLIPS,
+    }
+    records = []
+    info = ts.run_process_pipeline(
+        settings, requests, records.append, ready_timeout_s=600
+    )
+    assert "abort" not in info, info
+    assert info["exitcodes"] == {"soma": 0, "head": 0, "prepare": 0}
+    assert [r["name"] for r in records] == [name for _, _, name in _PROC_CLIPS]
+    assert all(r["status"] == "ok" for r in records), records
+    assert not os.path.exists(tmp_path / "shm")  # crops removed
+    reference = _reference(frames_of, camera, perspective)
+    for name, (results, _, _) in reference.items():
+        ref_clip = ts.PreparedClip(
+            request=next(r for r in requests if r.name == name),
+            out_dir=tmp_path / "ref" / name,
+            image_ids=[f"{i:06d}" for i in range(len(frames_of[name][1]))],
+        )
+        ref_clip.out_dir.mkdir(parents=True)
+        ts.save_clip_outputs(ref_clip, results, ["left", "right"])
+        for hand in ("left", "right"):
+            got = np.load(tmp_path / "out" / name / f"{hand}_results.npz")
+            want = np.load(ref_clip.out_dir / f"{hand}_results.npz")
+            assert sorted(got.files) == sorted(want.files)
+            for key in want.files:
+                assert got[key].dtype == want[key].dtype, (name, hand, key)
+                np.testing.assert_array_equal(
+                    got[key], want[key], err_msg=f"{name} {hand} {key}"
+                )
