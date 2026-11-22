@@ -133,6 +133,8 @@ class EgoHandPredictor:
         self._use_perspective_cropping = use_perspective_cropping
 
         self.model = model.eval().to(device)
+        # What from_checkpoint's apply_mhr_presort patched (None: not applied).
+        self.mhr_presort = None
 
         self._model_wrist_orients = None
         if self._use_perspective_cropping:
@@ -187,6 +189,7 @@ class EgoHandPredictor:
         dtype: torch.dtype = torch.float32,
         smooth: bool = False,
         use_perspective_cropping: bool = False,
+        mhr_presorted_sparse: bool = True,
     ) -> "EgoHandPredictor":
         """Load a checkpoint and return a ready-to-use predictor.
 
@@ -203,13 +206,18 @@ class EgoHandPredictor:
             smooth: Enable adaptive parameter smoothing (default off).
             use_perspective_cropping: Use perspective cropping for each
                 hand bbox before inference (default off).
+            mhr_presorted_sparse: Build the MHR pose-corrective sparse matrix
+                once, coalesced, instead of on every SOMA call, whose merge
+                sort can fault with the CCCL bundled in PyTorch builds for
+                CUDA 13.0 (``inference/pipeline/mhr_presort.py``). Same
+                results. Default on; ``False`` keeps the TorchScript forward.
 
         Returns:
             Predictor owning the loaded checkpoint and inference configuration.
         """
         model, target = load_egohand_model(egohand_ckpt_path, soma_hand_data_folder)
         log.warning("[EgoHand] Model: %s (dtype=%s)", target, dtype)
-        return cls(
+        predictor = cls(
             model=model,
             batch_size=batch_size,
             device=device,
@@ -217,6 +225,16 @@ class EgoHandPredictor:
             smooth=smooth,
             use_perspective_cropping=use_perspective_cropping,
         )
+        if mhr_presorted_sparse:
+            from inference.pipeline.mhr_presort import apply_mhr_presort
+
+            predictor.mhr_presort = apply_mhr_presort(predictor.model, device)
+            if predictor.mhr_presort["patched"]:
+                log.warning(
+                    "[EgoHand] MHR sparse layer coalesced at load: %d model(s)",
+                    len(predictor.mhr_presort["patched"]),
+                )
+        return predictor
 
     @torch.no_grad()
     def run(

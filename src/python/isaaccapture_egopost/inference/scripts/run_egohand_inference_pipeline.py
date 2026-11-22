@@ -707,6 +707,7 @@ def main():
         dtype=dtype,
         smooth=args.postprocessing_smooth,
         use_perspective_cropping=use_perspective_cropping,
+        mhr_presorted_sparse=args.mhr_presorted_sparse,
     )
     if args.dino_compile:
         predictor.enable_dino_compile()
