@@ -16,8 +16,8 @@ Each stage reports wall-clock elapsed time in milliseconds, measured with `time.
 | `MODEL_LOAD` | One-time: `EgoHandPredictor.from_checkpoint(...)` (checkpoint load + model construction + device placement) |
 | `BBOX_DETECTION` | `pipeline.bbox_detector.run(...)` -- whichever backend is configured (`rtdetr`, or the JSON-read time for `saved_bboxes`). Not recorded when `bbox_detector` is `None` (ground-truth boxes passed directly) |
 | `INFERENCE` | The whole `predictor.run(...)` call. Roughly the sum of `PREPROCESSING` + `BATCH_ASSEMBLY` + `MODEL_FORWARD` + `POST_FORWARD` + `ADAPTIVE_SMOOTHING` |
-| `PREPROCESSING` | Hand-crop preparation: perspective cropping (`--perspective_cropping`) or bbox cropping + resizing, whichever mode the run uses (never both) |
-| `BATCH_ASSEMBLY` | Stacking crops and camera data into batch tensors and copying them to the GPU |
+| `PREPROCESSING` | Waiting for hand crops: perspective cropping (`--perspective_cropping`) or bbox cropping + resizing, whichever mode the run uses (never both). Crops of later batches are prepared on worker threads and uploaded while earlier batches run (`inference/pipeline/crop_stream.py`), so only the crop time not hidden behind them is counted |
+| `BATCH_ASSEMBLY` | Stacking camera data into batch tensors and copying them to the GPU, and waiting for the crop upload of that batch |
 | `MODEL_FORWARD` | `model.forward_step(...)` only, bracketed with `torch.cuda.synchronize()` so its GPU time doesn't leak into neighboring stages |
 | `POST_FORWARD` | Camera math, right-hand mirror, copying outputs back to the CPU, and assembling result dicts |
 | `ADAPTIVE_SMOOTHING` | `smooth_adaptive_hand_results(...)`. Only recorded when `--postprocessing_smooth` is on (the default) |

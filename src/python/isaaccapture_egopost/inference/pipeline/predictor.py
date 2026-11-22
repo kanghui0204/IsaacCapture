@@ -32,6 +32,7 @@ from inference.camera.camera_models import CameraModel
 from inference.camera.perspective_crop import perspective_crop
 from egohand.utils.cam_utils import compute_transl_full_cam
 from inference.perf import PerfReporter, PerfStage
+from inference.pipeline.crop_stream import StreamedCropBatches
 from inference.pipeline.results_io import KEYPOINT_RELIABILITY_FIELDS
 from inference.preprocessing.crop import (
     IMAGENET_MEAN,
@@ -114,6 +115,11 @@ class EgoHandPredictor:
         use_perspective_cropping: Use perspective cropping for each hand
             bbox with the source camera's ``project`` and ``unproject`` methods.
     """
+
+    # Crop while earlier batches run (see ``inference/pipeline/crop_stream.py``).
+    # Same crops, order and batches as building every crop first; False
+    # restores the build-everything-first path.
+    stream_crops = True
 
     def __init__(
         self,
@@ -386,41 +392,46 @@ class EgoHandPredictor:
 
         perf_reporter = getattr(self, "perf_reporter", None)
         prepared_inputs_by_image = {}
-        if crop_jobs:
-            crop_workers = min(8, (os.cpu_count() or 1))
-            preprocessing_start = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=crop_workers) as pool:
-                for image_id, hand, prepared_hand_data in pool.map(
-                    _build_input, crop_jobs
-                ):
-                    if prepared_hand_data is not None:
-                        prepared_inputs_by_image.setdefault(image_id, {})[hand] = (
-                            prepared_hand_data
-                        )
-            if perf_reporter is not None:
-                preprocessing_ms_per_frame = (
-                    (time.perf_counter() - preprocessing_start) * 1000 / len(image_ids)
-                )
-                perf_reporter.record_latency(
-                    PerfStage.PREPROCESSING, preprocessing_ms_per_frame
+        if (
+            crop_jobs
+            and getattr(self, "stream_crops", False)
+            and len(set(image_ids)) == len(image_ids)
+        ):
+            # Crops of later batches are prepared while earlier batches run.
+            # Batches are formed from the valid crops in job order, exactly as
+            # the list path below slices ``prepared_inputs``.
+            def _keep_metadata(image_id, hand, prepared_hand_data):
+                prepared_inputs_by_image.setdefault(image_id, {})[hand] = (
+                    prepared_hand_data
                 )
 
-        prepared_inputs = [
-            prepared_hand_data
-            for image_id in image_ids
-            for prepared_hand_data in prepared_inputs_by_image.get(
-                image_id, {}
-            ).values()
-        ]
-
-        if prepared_inputs:
             log.warning(
-                "[EgoHand] Running inference on %d hand crop(s)...",
-                len(prepared_inputs),
+                "[EgoHand] Running inference on up to %d hand crop(s), cropped "
+                "while earlier batches run...",
+                len(crop_jobs),
             )
-        predictions = self._run_imagebased_predictions(
-            prepared_inputs, frame_count=len(image_ids)
-        )
+            with StreamedCropBatches(
+                crop_jobs,
+                _build_input,
+                batch_size=self.batch_size,
+                device=self.device,
+                workers=min(8, (os.cpu_count() or 1)),
+                copy_stream=self._crop_copy_stream(),
+                on_prepared=_keep_metadata,
+            ) as crop_batches:
+                predictions = self._run_imagebased_predictions(
+                    crop_batches, frame_count=len(image_ids)
+                )
+            if perf_reporter is not None:
+                # Crop time left on the critical path: waits for the next batch.
+                perf_reporter.record_latency(
+                    PerfStage.PREPROCESSING,
+                    crop_batches.wait_s * 1000 / len(image_ids),
+                )
+        else:
+            predictions = self._prepare_all_then_predict(
+                crop_jobs, _build_input, image_ids, prepared_inputs_by_image
+            )
 
         results_per_hand = {hand: {} for hand in hands}
         for result in predictions:
@@ -468,6 +479,63 @@ class EgoHandPredictor:
         if output_paths_per_hand is not None:
             self.save_results(results_per_hand, output_paths_per_hand)
         return results_per_hand
+
+    def _prepare_all_then_predict(
+        self, crop_jobs, build_input, image_ids, prepared_inputs_by_image
+    ):
+        """Build every crop first, then run the forward batches (previous path).
+
+        Used when ``stream_crops`` is off or ``image_ids`` repeats an ID.
+        Fills ``prepared_inputs_by_image`` and returns the predictions.
+        """
+        perf_reporter = getattr(self, "perf_reporter", None)
+        if crop_jobs:
+            crop_workers = min(8, (os.cpu_count() or 1))
+            preprocessing_start = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=crop_workers) as pool:
+                for image_id, hand, prepared_hand_data in pool.map(
+                    build_input, crop_jobs
+                ):
+                    if prepared_hand_data is not None:
+                        prepared_inputs_by_image.setdefault(image_id, {})[hand] = (
+                            prepared_hand_data
+                        )
+            if perf_reporter is not None:
+                preprocessing_ms_per_frame = (
+                    (time.perf_counter() - preprocessing_start) * 1000 / len(image_ids)
+                )
+                perf_reporter.record_latency(
+                    PerfStage.PREPROCESSING, preprocessing_ms_per_frame
+                )
+
+        prepared_inputs = [
+            prepared_hand_data
+            for image_id in image_ids
+            for prepared_hand_data in prepared_inputs_by_image.get(
+                image_id, {}
+            ).values()
+        ]
+
+        if prepared_inputs:
+            log.warning(
+                "[EgoHand] Running inference on %d hand crop(s)...",
+                len(prepared_inputs),
+            )
+        return self._run_imagebased_predictions(
+            prepared_inputs, frame_count=len(image_ids)
+        )
+
+    def _crop_copy_stream(self):
+        """One upload stream per predictor and CUDA device, reused across clips."""
+        if torch.device(self.device).type != "cuda":
+            return None
+        streams = self.__dict__.setdefault("_crop_copy_streams", {})
+        device = torch.device(self.device)
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        if device not in streams:
+            streams[device] = torch.cuda.Stream(device=device)
+        return streams[device]
 
     def postprocess_results(
         self,
@@ -656,6 +724,8 @@ class EgoHandPredictor:
             prepared_inputs: Ordered list of per-crop dicts built by ``run()``'s
                 preprocessing step. Each dict carries ``crop_tensor``,
                 ``model_bbx_xys``, ``model_K``, ``real_hand_side``, etc.
+                Alternatively a ``StreamedCropBatches`` that yields the same
+                batches, with the images already uploaded.
             frame_count: Number of frames these crops were drawn from, for
                 ``PerfStage.MODEL_FORWARD`` normalization. Required when
                 ``self.perf_reporter`` is set.
@@ -670,12 +740,20 @@ class EgoHandPredictor:
         batch_assembly_ms_total = 0.0
         forward_ms_total = 0.0
         post_forward_ms_total = 0.0
-        for start in range(0, len(prepared_inputs), self.batch_size):
+        if isinstance(prepared_inputs, StreamedCropBatches):
+            # Batches of valid crops, already uploaded while earlier batches ran.
+            batch_source = ((staged.hand_data, staged) for staged in prepared_inputs)
+        else:
+            batch_source = (
+                (prepared_inputs[start : start + self.batch_size], None)
+                for start in range(0, len(prepared_inputs), self.batch_size)
+            )
+        for batch_hand_data, staged in batch_source:
             batch_assembly_start = time.perf_counter()
-            end = min(start + self.batch_size, len(prepared_inputs))
-            batch_hand_data = prepared_inputs[start:end]
             batch = {
-                "img": torch.stack([d["crop_tensor"] for d in batch_hand_data]).to(
+                "img": staged.images(self.device)
+                if staged is not None
+                else torch.stack([d["crop_tensor"] for d in batch_hand_data]).to(
                     self.device
                 ),
                 "bbx_xys": torch.from_numpy(
@@ -695,7 +773,7 @@ class EgoHandPredictor:
                 .to(self.device),
                 # Right-hand crops were flipped into the left-hand canonical frame
                 # during preprocessing; the model always sees left-hand inputs.
-                "hand_type": ["left"] * (end - start),
+                "hand_type": ["left"] * len(batch_hand_data),
             }
             if perf_reporter is not None and self.device != "cpu":
                 # Counted in batch assembly: waits for the host-to-device copies.
@@ -900,6 +978,10 @@ class EgoHandPredictor:
                     {key: values[i] for key, values in reliability_cpu.items()}
                 )
             post_forward_ms_total += (time.perf_counter() - post_forward_start) * 1000
+            if staged is not None:
+                # Every read of this batch's images is queued; reuse the slot.
+                del batch
+                staged.release()
         if perf_reporter is not None and frame_count:
             perf_reporter.record_latency(
                 PerfStage.BATCH_ASSEMBLY, batch_assembly_ms_total / frame_count

@@ -44,15 +44,18 @@ STAGE_DESCRIPTIONS: dict[PerfStage, str] = {
         "outside this stage (still inside total_wall)."
     ),
     PerfStage.PREPROCESSING: (
-        "Per-frame wall time of hand-crop preparation: either perspective "
-        "cropping (--perspective_cropping) or bbox cropping + resizing, "
-        "whichever mode this run uses -- the two are mutually exclusive "
-        "per run, never both."
+        "Per-frame wall time the forward loop waits for hand crops: either "
+        "perspective cropping (--perspective_cropping) or bbox cropping + "
+        "resizing, whichever mode this run uses -- the two are mutually "
+        "exclusive per run, never both. Crops of later batches are prepared "
+        "on worker threads and uploaded while earlier batches run, so only "
+        "the crop time not hidden behind them is counted."
     ),
     PerfStage.BATCH_ASSEMBLY: (
-        "Per-frame wall time of stacking prepared crops and camera data into "
-        "batch tensors and copying them to the GPU, up to and including a "
-        "torch.cuda.synchronize() that waits for those copies to finish."
+        "Per-frame wall time of stacking camera data into batch tensors and "
+        "copying them to the GPU (the crop images are already uploaded), up "
+        "to and including a torch.cuda.synchronize() that waits for those "
+        "copies to finish."
     ),
     PerfStage.MODEL_FORWARD: (
         "Per-frame wall time of the model's forward pass only. Bracketed "
