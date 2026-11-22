@@ -56,7 +56,23 @@ class DinoV3Backbone(nn.Module):
         ),
     }
 
-    def __init__(self, name: str = "dinov3_vith16plus", drop_path_rate: float = 0.1):
+    def __init__(
+        self,
+        name: str = "dinov3_vith16plus",
+        drop_path_rate: float = 0.1,
+        meta_init: bool = False,
+    ):
+        """Build the DINOv3 encoder.
+
+        Args:
+            name: Architecture key in ``_ARCH_KWARGS``.
+            drop_path_rate: Stochastic depth rate (training only).
+            meta_init: Inference loading only. Allocate the encoder on the
+                ``meta`` device and skip its random initialization; the caller
+                must materialize it with ``encoder.to_empty(device=...)`` and
+                then load every encoder tensor from a checkpoint. Training
+                configs leave this ``False``.
+        """
         super().__init__()
         if name not in self._ARCH_KWARGS:
             raise ValueError(
@@ -67,8 +83,14 @@ class DinoV3Backbone(nn.Module):
 
         vit_kwargs = dict(self._ARCH_KWARGS[name])
         vit_kwargs["drop_path_rate"] = drop_path_rate
-        self.encoder = DinoVisionTransformer(**vit_kwargs)
-        self.encoder.init_weights()
+        if meta_init:
+            # 840M parameters: random CPU initialization dominates model
+            # construction, and every value is overwritten by the checkpoint.
+            with torch.device("meta"):
+                self.encoder = DinoVisionTransformer(**vit_kwargs)
+        else:
+            self.encoder = DinoVisionTransformer(**vit_kwargs)
+            self.encoder.init_weights()
         self.name = name
         self.patch_size = self.encoder.patch_size
         self.embed_dim = self.embed_dims = self.encoder.embed_dim

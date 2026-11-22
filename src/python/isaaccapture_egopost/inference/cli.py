@@ -33,7 +33,9 @@ def parse_args(argv=None, *, epilog: str | None = None):
     p.add_argument(
         "--egohand_ckpt",
         default=_bundled_default("EGOHAND_DEFAULT_CKPT"),
-        help="EgoHand checkpoint (.ckpt). Default: the file named by "
+        help="EgoHand checkpoint (.ckpt), or an inference-weights folder written by "
+        "inference/scripts/export_inference_weights.py (model.safetensors + "
+        "config.json; faster to load, no pickle). Default: the file named by "
         "$EGOHAND_DEFAULT_CKPT if it exists (bundled in the release image), otherwise downloaded from "
         "the nvidia/EgoHand-v1 HF repo (see --egohand_ckpt_hf_path) and cached locally -- "
         "pass an explicit path to use a local checkpoint instead.",

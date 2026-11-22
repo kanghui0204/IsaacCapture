@@ -4,7 +4,8 @@
 """EgoHand checkpoint loading, forward pass, and SOMA NPZ writing.
 
 Owns the full model lifecycle for inference:
-- ``load_egohand_model``: loads a checkpoint and returns a CPU-eval model.
+- ``load_egohand_model``: loads a checkpoint (.ckpt or inference export) and
+  returns an eval model with strict key checks.
 - ``EgoHandPredictor``: owns one loaded model, runs batched crop-and-forward loops,
   and writes soma.io-compatible prediction files.
 - ``EgoHandPredictor.from_checkpoint``: convenience factory that combines both steps.
@@ -33,6 +34,11 @@ from inference.camera.perspective_crop import perspective_crop
 from egohand.utils.cam_utils import compute_transl_full_cam
 from inference.perf import PerfReporter, PerfStage
 from inference.pipeline.crop_stream import StreamedCropBatches
+from inference.pipeline.inference_weights import (
+    CheckpointSource,
+    check_state_dict_keys,
+    read_checkpoint,
+)
 from inference.pipeline.results_io import KEYPOINT_RELIABILITY_FIELDS
 from inference.preprocessing.crop import (
     IMAGENET_MEAN,
@@ -56,26 +62,9 @@ log = logging.getLogger(__name__)
 _VALID_TARGETS = ("egohand.EgoHand",)
 
 
-def load_egohand_model(checkpoint_path: str | Path, soma_hand_data_folder: str | Path):
-    """Load a EgoHand model from a checkpoint.
-
-    Reads the training-time cfg stored in ``ckpt["hyper_parameters"]["cfg"]``,
-    overrides the two inference-only knobs (skip pretrained backbone load,
-    redirect SOMAHand asset folder), instantiates the right model class, and
-    loads weights. Returns the model in CPU eval mode; the caller moves it to
-    the target device.
-
-    Args:
-        checkpoint_path: Path to a ``.ckpt`` file produced by this repo's
-            training entrypoint.
-        soma_hand_data_folder: SOMAHand asset folder to redirect ``cfg.soma_hand.data_root``.
-
-    Returns:
-        model: EgoHand instance in eval mode on CPU.
-        target: The ``_target_`` string from the checkpoint cfg (for logging).
-    """
-    ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
-    cfg = OmegaConf.create(ckpt["hyper_parameters"]["cfg"])
+def _validated_cfg(source: CheckpointSource, soma_hand_data_folder):
+    """Training cfg with the inference-only overrides applied."""
+    cfg = OmegaConf.create(source.cfg)
     target = str(cfg.get("_target_", ""))
     if not any(target.endswith(t) for t in _VALID_TARGETS):
         raise ValueError(
@@ -84,14 +73,97 @@ def load_egohand_model(checkpoint_path: str | Path, soma_hand_data_folder: str |
         )
     cfg.backbone_weights = None
     cfg.soma_hand.data_root = str(soma_hand_data_folder)
+    return cfg, target
+
+
+def load_egohand_model(
+    checkpoint_path: str | Path | CheckpointSource,
+    soma_hand_data_folder: str | Path,
+    device: str | torch.device = "cpu",
+    *,
+    ignore_unexpected_keys: bool = False,
+):
+    """Load a EgoHand model from a checkpoint.
+
+    Reads the training-time cfg stored in ``ckpt["hyper_parameters"]["cfg"]``,
+    overrides the two inference-only knobs (skip pretrained backbone load,
+    redirect SOMAHand asset folder), instantiates the right model class, and
+    loads weights. Returns the model in eval mode on ``device`` (CPU by
+    default; the caller may still move it).
+
+    Accepts a training ``.ckpt`` (memory-mapped, so optimizer state is never
+    read) or an export from ``inference/scripts/export_inference_weights.py``.
+    The DINOv3 encoder is allocated without random initialization and filled
+    from the checkpoint. Loading is strict except for the keys listed in
+    ``inference_weights.ALLOWED_MISSING_PREFIXES`` (asset-derived SOMA layers).
+
+    Args:
+        checkpoint_path: ``.ckpt`` file, export folder, or a ``CheckpointSource``
+            already returned by ``read_checkpoint``.
+        soma_hand_data_folder: SOMAHand asset folder to redirect ``cfg.soma_hand.data_root``.
+        device: Device for the returned model.
+        ignore_unexpected_keys: Load a checkpoint that also holds tensors the
+            model does not own (logged as a warning instead of an error).
+            Missing keys are always an error.
+
+    Returns:
+        model: EgoHand instance in eval mode on ``device``.
+        target: The ``_target_`` string from the checkpoint cfg (for logging).
+    """
+    source = (
+        checkpoint_path
+        if isinstance(checkpoint_path, CheckpointSource)
+        else read_checkpoint(checkpoint_path)
+    )
+    cfg, target = _validated_cfg(source, soma_hand_data_folder)
+    backbone_cfg = cfg.get("backbone", None)
+    meta_backbone = backbone_cfg is not None and str(
+        backbone_cfg.get("_target_", "")
+    ).endswith("DinoV3Backbone")
+    if meta_backbone:
+        cfg.backbone.meta_init = True
 
     from egohand.models.egohand import EgoHand
 
     model = EgoHand(cfg)
+    model.validate_camera_depth_checkpoint(source.validation_view())
+    if meta_backbone:
+        model.backbone.encoder.to_empty(device=device)
+    model = model.to(device)
 
-    model.validate_camera_depth_checkpoint(ckpt)
-    model.load_state_dict(ckpt["state_dict"], strict=False)
-    log.info("[EgoHand] Loaded checkpoint: %s", checkpoint_path)
+    state_dict = source.load_state_dict()
+    if meta_backbone:
+        # to_empty() leaves memory uninitialized: every encoder tensor must come
+        # from the checkpoint, independently of the allowlist below.
+        encoder_keys = {
+            f"backbone.encoder.{key}" for key in model.backbone.encoder.state_dict()
+        }
+        absent = sorted(encoder_keys - state_dict.keys())
+        if absent:
+            raise RuntimeError(
+                f"Checkpoint lacks {len(absent)} DINOv3 encoder tensor(s): {absent[:10]}"
+            )
+        # Tensors to_empty() materialized that no checkpoint can fill (buffers
+        # registered with persistent=False) would keep uninitialized memory.
+        stray = sorted(
+            name
+            for name, _ in model.backbone.encoder.named_buffers()
+            if name not in model.backbone.encoder.state_dict()
+        )
+        if stray:
+            raise RuntimeError(
+                f"DINOv3 encoder has non-persistent buffer(s) {stray[:10]} that "
+                "meta initialization would leave uninitialized"
+            )
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    check_state_dict_keys(missing, unexpected, ignore_unexpected=ignore_unexpected_keys)
+    log.info(
+        "[EgoHand] Loaded %s checkpoint %s: %d tensors; %d allowlisted missing key(s)",
+        source.format,
+        source.path,
+        len(state_dict),
+        len(missing),
+    )
     return model.eval(), target
 
 
@@ -201,7 +273,8 @@ class EgoHandPredictor:
         you already have a loaded model (e.g. in tests).
 
         Args:
-            egohand_ckpt_path: EgoHand ``.ckpt`` path.
+            egohand_ckpt_path: EgoHand ``.ckpt`` path, inference-weights
+                export folder, or a ``CheckpointSource``.
             soma_hand_data_folder: SOMAHand asset folder.
             batch_size: Hand crops per forward pass.
             device: Torch device for inference.
@@ -213,7 +286,9 @@ class EgoHandPredictor:
         Returns:
             Predictor owning the loaded checkpoint and inference configuration.
         """
-        model, target = load_egohand_model(egohand_ckpt_path, soma_hand_data_folder)
+        model, target = load_egohand_model(
+            egohand_ckpt_path, soma_hand_data_folder, device=device
+        )
         log.warning("[EgoHand] Model: %s (dtype=%s)", target, dtype)
         return cls(
             model=model,
